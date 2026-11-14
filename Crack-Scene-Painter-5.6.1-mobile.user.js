@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.2
+// @version      5.6.3
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.2: 플로팅 버튼 제거, 크랙 설정 메뉴에서 삽화 설정과 갤러리 접근.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.3: OpenAI GPT 장면 분석과 만화 콘티 지원.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -11,6 +11,7 @@
 // @grant        GM_deleteValue
 // @connect      generativelanguage.googleapis.com
 // @connect      api.deepseek.com
+// @connect      api.openai.com
 // @connect      image.novelai.net
 // @connect      api.novelai.net
 // @connect      crack-api.wrtn.ai
@@ -29,6 +30,7 @@
     const SECRET_SETTING_FIELDS = Object.freeze([
         'googleApiKey',
         'deepseekApiKey',
+        'openaiApiKey',
         'firebaseConfigJson',
         'firebaseAppCheckDebugToken',
         'naiApiKey'
@@ -238,10 +240,30 @@
         )).join('');
     }
 
+    const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
+    const OPENAI_MODELS = Object.freeze({
+        'gpt-6-luna': 'GPT-6 Luna',
+        'gpt-6.1-sol': 'GPT-6.1 Sol',
+        'gpt-6.1-terra': 'GPT-6.1 Terra',
+        'gpt-6-astra': 'GPT-6 Astra'
+    });
+
+    function normalizeOpenAiModelId(model) {
+        const id = String(model || '').trim().toLowerCase();
+        return Object.hasOwn(OPENAI_MODELS, id) ? id : OPENAI_DEFAULT_MODEL;
+    }
+
+    function buildOpenAiModelOptionsHtml(model) {
+        const selected = normalizeOpenAiModelId(model);
+        return Object.entries(OPENAI_MODELS).map(([id, label]) =>
+            `<option value="${id}" ${id === selected ? 'selected' : ''}>${label}</option>`
+        ).join('');
+    }
+
     function normalizeSceneAnalyzerProvider(provider) {
         const raw = String(provider || 'ai-studio').trim().toLowerCase();
         if (['firebase-ai', 'firebase-ai-logic', 'firebase-ailogic', 'firebase ai logic beta'].includes(raw)) return 'firebase';
-        if (raw === 'deepseek') return 'deepseek';
+        if (raw === 'deepseek' || raw === 'openai') return raw;
         if (raw === 'firebase') return 'firebase';
         // v4.33.0: direct Vertex provider removed. Old installs fall back to Firebase when configured, otherwise AI Studio.
         return 'ai-studio';
@@ -678,7 +700,7 @@
         return { thinking: { type: 'enabled' }, reasoning_effort: 'high' };
     }
 
-    function convertGeminiPayloadToDeepSeek(payload, requestConfig) {
+    function getSceneAnalyzerTextMessages(payload) {
         const systemText = String((payload?.systemInstruction?.parts || [])
             .map(part => part?.text || '')
             .filter(Boolean)
@@ -696,13 +718,17 @@
             if (contentText) messages.push({ role, content: contentText });
         });
 
+        return messages.length ? messages : [{ role: 'user', content: 'Return a response.' }];
+    }
+
+    function convertGeminiPayloadToDeepSeek(payload, requestConfig) {
         const generationConfig = payload?.generationConfig || {};
         const wantsJson = hasGeminiStructuredOutputConfig(payload);
         const maxTokens = Number(generationConfig.maxOutputTokens || generationConfig.max_tokens || 0);
 
         return {
             model: normalizeDeepSeekModelId(requestConfig?.model),
-            messages: messages.length ? messages : [{ role: 'user', content: 'Return a response.' }],
+            messages: getSceneAnalyzerTextMessages(payload),
             stream: false,
             ...(wantsJson ? { response_format: { type: 'json_object' } } : {}),
             ...(maxTokens > 0 ? { max_tokens: Math.max(1, Math.floor(maxTokens)) } : {}),
@@ -736,9 +762,63 @@
         };
     }
 
+    async function callOpenAiResponses(requestConfig, payload, signal) {
+        const input = getSceneAnalyzerTextMessages(payload);
+        const wantsJson = hasGeminiStructuredOutputConfig(payload);
+        if (wantsJson) {
+            input.unshift({ role: 'developer', content: 'Return exactly one JSON object matching the requested format.' });
+        }
+
+        const configuredLimit = Number(payload?.generationConfig?.maxOutputTokens || 0);
+        const data = await gmRequestJson({
+            method: 'POST',
+            url: requestConfig.url,
+            headers: requestConfig.headers,
+            data: {
+                model: requestConfig.model,
+                input,
+                store: false,
+                reasoning: { effort: 'low' },
+                max_output_tokens: configuredLimit > 0 ? Math.floor(configuredLimit) : 16384,
+                ...(wantsJson ? { text: { format: { type: 'json_object' } } } : {})
+            },
+            signal
+        });
+        throwIfCspAborted(signal);
+
+        const parts = (Array.isArray(data?.output) ? data.output : [])
+            .filter(item => item?.type === 'message' && item.role === 'assistant')
+            .flatMap(item => Array.isArray(item.content) ? item.content : []);
+        if (parts.some(part => part?.type === 'refusal')) {
+            throw new Error('OpenAI 모델이 이 장면 분석 요청을 거절했어요.');
+        }
+        if (data?.status === 'incomplete') {
+            const reason = data.incomplete_details?.reason;
+            if (reason === 'max_output_tokens') {
+                throw new Error('OpenAI 응답이 출력 한도에 도달했어요. 분석할 내용을 줄여서 다시 시도해줘.');
+            }
+            if (reason === 'content_filter') throw new Error('OpenAI 콘텐츠 필터로 분석이 중단됐어요.');
+            throw new Error('OpenAI 응답이 완료되기 전에 중단됐어요.');
+        }
+        if (data?.status !== 'completed') {
+            throw new Error('OpenAI 응답 실패: ' + (data?.error?.message || data?.status || '알 수 없는 상태'));
+        }
+        const text = parts
+            .filter(part => part?.type === 'output_text' && typeof part.text === 'string')
+            .map(part => part.text)
+            .join('')
+            .trim();
+        if (!text) throw new Error('OpenAI 응답 본문이 비어 있어요.');
+        return { candidates: [{ content: { parts: [{ text }] } }] };
+    }
+
     async function requestGeminiGenerateContent(geminiRequest, payload, options = {}) {
-        const payloadWithSafetySettings = withGeminiSafetySettings(payload);
         const signal = options?.signal || null;
+        if (geminiRequest?.provider === 'openai') {
+            return callOpenAiResponses(geminiRequest, payload, signal);
+        }
+
+        const payloadWithSafetySettings = withGeminiSafetySettings(payload);
 
         const requestOnce = async (requestConfig, requestPayload = payloadWithSafetySettings) => {
             throwIfCspAborted(signal);
@@ -901,6 +981,21 @@
 
         const headers = { 'Content-Type': 'application/json' };
 
+        if (provider === 'openai') {
+            const apiKey = String(global?.openaiApiKey || '').trim();
+            if (!apiKey) {
+                if (silent) return null;
+                throw new Error('OpenAI API 키가 비어 있어요. 연결 설정에서 OpenAI API 키를 입력해줘.');
+            }
+            headers.Authorization = `Bearer ${apiKey}`;
+            return {
+                provider,
+                model: normalizeOpenAiModelId(global?.openaiModel),
+                headers,
+                url: 'https://api.openai.com/v1/responses'
+            };
+        }
+
         if (provider === 'deepseek') {
             const apiKey = String(global?.deepseekApiKey || '').trim();
             const model = normalizeDeepSeekModelId(global?.deepseekModel);
@@ -1037,8 +1132,8 @@
     }
 
     function buildGeminiJsonGenerationConfig(geminiRequest, baseConfig = {}) {
-        if (geminiRequest?.provider === 'deepseek') {
-            // DeepSeek adapter가 이 marker를 response_format:{type:'json_object'}로 변환한다.
+        if (geminiRequest?.provider === 'deepseek' || geminiRequest?.provider === 'openai') {
+            // 각 API 요청에서 이 값을 JSON 모드로 변환한다.
             return {
                 ...baseConfig,
                 responseMimeType: 'application/json'
@@ -1075,6 +1170,7 @@
         if (modelOrRequest?.provider === 'deepseek') {
             return { maxOutputTokens: 256 };
         }
+        if (modelOrRequest?.provider === 'openai') return { maxOutputTokens: 1024 };
         const normalizedModel = normalizeGeminiModelId(modelOrRequest?.model || modelOrRequest);
         return {
             maxOutputTokens: 1024,
@@ -2269,6 +2365,8 @@ director.lightingIntent:
             googleModel: 'gemini-3.7-flash',
             deepseekApiKey: '',
             deepseekModel: 'deepseek-v4-flash',
+            openaiApiKey: '',
+            openaiModel: OPENAI_DEFAULT_MODEL,
             geminiThinkingMode: 'auto',
             firebaseConfigJson: '',
             firebaseAppCheckDebugToken: '',
@@ -2513,6 +2611,7 @@ director.lightingIntent:
             ? 'firebase'
             : normalizeSceneAnalyzerProvider(rawProvider);
         merged.deepseekModel = normalizeDeepSeekModelId(merged.deepseekModel);
+        merged.openaiModel = normalizeOpenAiModelId(merged.openaiModel);
         delete merged.vertexProjectId;
         delete merged.vertexLocation;
         delete merged.vertexAccessToken;
@@ -2711,8 +2810,8 @@ director.lightingIntent:
         const rawProvider = String(saved?.geminiProvider || '').trim().toLowerCase();
 
         if (!hasFirebaseConfig) return;
-        if (rawProvider === 'firebase' || rawProvider === 'deepseek') return;
-        if (rawProvider === 'ai-studio' && String(saved?.googleApiKey || '').trim()) return;
+        if (rawProvider !== 'ai-studio') return;
+        if (String(saved?.googleApiKey || '').trim()) return;
 
         saved.geminiProvider = 'firebase';
         saveGlobalSettings(saved);
@@ -7223,7 +7322,7 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
             if (start !== -1 && end !== -1 && end > start) {
                 return JSON.parse(raw.slice(start, end + 1));
             }
-            throw new Error('Gemini 응답에서 JSON을 찾지 못했어요.');
+            throw new Error('장면 분석 응답에서 JSON을 찾지 못했어요.');
         }
     }
 
@@ -8777,7 +8876,7 @@ ${JSON.stringify(safePlan, null, 2)}
             })
         };
 
-        reportProgress({ title: 'Gemini 분석 요청', message: '장면 계획과 프롬프트 초안을 요청했어.', progress: 46 });
+        reportProgress({ title: '장면 분석 요청', message: '장면 계획과 프롬프트 초안을 요청했어.', progress: 46 });
         const data = await requestGeminiGenerateContent(geminiRequest, payload, { signal });
 
         reportProgress({ title: '응답 해석 중', message: '받아온 JSON과 장면 태그를 확인하고 있어.', progress: 68 });
@@ -9654,9 +9753,9 @@ ${JSON.stringify(safePlan, null, 2)}
         button?.setAttribute('data-csp-loading', 'true');
         if (button) {
             button.disabled = true;
-            button.title = 'Gemini가 장면을 분석 중...';
+            button.title = '장면 분석 중...';
         }
-        showToast('🔎 Gemini가 장면과 삽입 위치를 분석 중...');
+        showToast('🔎 장면과 삽입 위치를 분석 중...');
         let hud = null;
         let timedOut = false;
         let analysisTimeoutId = 0;
@@ -9675,24 +9774,24 @@ ${JSON.stringify(safePlan, null, 2)}
                 }
             });
             assertCurrentCspWorkTarget(workTarget);
-            debugLog('Gemini scene plan ready', {
+            debugLog('Scene plan ready', {
                 key,
                 insertAfterParagraph: plan?.insertAfterParagraph,
                 visibleCharacters: plan?.visibleCharacters?.length || 0
             });
-            updateTaskHud({ title: '분석 완료', message: 'Gemini 분석이 끝났어. 생성 전에 확인창을 열어줄게.', progress: 100, status: 'success' });
+            updateTaskHud({ title: '분석 완료', message: '장면 분석이 끝났어. 생성 전에 확인창을 열어줄게.', progress: 100, status: 'success' });
             openV35Studio({ targetBubble: bubble, markdown, plan });
-            showToast('✅ Gemini 분석 완료. 생성 전 확인창을 열었어요.');
+            showToast('✅ 장면 분석 완료. 생성 전 확인창을 열었어요.');
             setTimeout(() => { if (currentTaskHud === hud) hideTaskHud(); }, 360);
         } catch (err) {
             const failure = timedOut
                 ? new Error(`장면 분석이 ${Math.round(CSP_SCENE_ANALYSIS_TIMEOUT_MS / 1000)}초 안에 끝나지 않아 중단했어요. API 연결과 모델 설정을 확인해줘.`)
                 : err;
-            console.error('[Crack Scene Painter] Gemini 분석 실패:', failure);
+            console.error('[Crack Scene Painter] 장면 분석 실패:', failure);
             if (hud && currentTaskHud === hud) {
                 updateTaskHud({ title: '분석 실패', message: '확인창을 열기 전에 작업이 중단됐어.\n콘솔의 [Crack Scene Painter] 로그와 오류 메시지를 확인해줘.\n\n사유: ' + (failure?.message || failure), progress: 100, status: 'error' });
             }
-            showToast('⚠️ Gemini 분석 실패: ' + (failure?.message || failure));
+            showToast('⚠️ 장면 분석 실패: ' + (failure?.message || failure));
             if (hud) setTimeout(() => { if (currentTaskHud === hud) hideTaskHud(); }, 1800);
         } finally {
             if (analysisTimeoutId) clearTimeout(analysisTimeoutId);
@@ -12971,10 +13070,12 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
             googleModel:normalizeGeminiModelId(h.querySelector('#s-google-model')?.value||g.googleModel),
             geminiThinkingMode:normalizeGeminiThinkingMode(h.querySelector('#s-thinking')?.value||g.geminiThinkingMode),
             deepseekModel:normalizeDeepSeekModelId(h.querySelector('#s-deep-model')?.value||g.deepseekModel),
+            openaiModel:normalizeOpenAiModelId(h.querySelector('#s-openai-model')?.value||g.openaiModel),
             // Firebase 칸은 Firebase를 골랐을 때만 그려지므로, 칸이 없으면 저장된 리전/SDK를 그대로 둔다.
             firebaseLocation:(h.querySelector('#s-floc')?h.querySelector('#s-floc').value.trim():g.firebaseLocation)||'global',firebaseSdkVersion:(h.querySelector('#s-fsdk')?h.querySelector('#s-fsdk').value.trim():g.firebaseSdkVersion)||'12.5.0',
             googleApiKey:h.querySelector('#s-google-key')?.value.trim()||(preserveSecrets?g.googleApiKey:''),
             deepseekApiKey:h.querySelector('#s-deep-key')?.value.trim()||(preserveSecrets?g.deepseekApiKey:''),
+            openaiApiKey:h.querySelector('#s-openai-key')?.value.trim()||(preserveSecrets?g.openaiApiKey:''),
             firebaseConfigJson:h.querySelector('#s-firebase')?.value.trim()||(preserveSecrets?g.firebaseConfigJson:''),
             firebaseAppCheckDebugToken:h.querySelector('#s-fappcheck')?.value.trim()||(preserveSecrets?g.firebaseAppCheckDebugToken:''),
             naiApiKey:h.querySelector('#s-nai-key')?.value.trim()||(preserveSecrets?g.naiApiKey:'')
@@ -12982,6 +13083,15 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
     }
     function renderV35Connections(h){
         const g=getGlobalSettings(),provider=normalizeSceneAnalyzerProvider(g.geminiProvider);
+        const openAiPanel = `<div class="section">
+            <div class="section-title">OpenAI <span class="badge ${g.openaiApiKey?'ok':''}">${g.openaiApiKey?'● 설정됨':'○ 미설정'}</span></div>
+            <div class="field"><label for="s-openai-model">모델</label>
+                <select class="select" id="s-openai-model">${buildOpenAiModelOptionsHtml(g.openaiModel)}</select>
+            </div>
+            <div class="field"><label for="s-openai-key">API 키</label>
+                <input class="input" id="s-openai-key" type="password" autocomplete="off" spellcheck="false" placeholder="${g.openaiApiKey?'저장됨 · 변경할 때만 입력':'OpenAI API Key'}">
+            </div>
+        </div>`;
         const providerPanel=provider==='deepseek'
             ? `<div class="section"><div class="section-title">🧠 DeepSeek <span class="badge ${g.deepseekApiKey?'ok':''}">${g.deepseekApiKey?'● 설정됨':'○ 미설정'}</span></div><div class="field"><label>모델</label><select class="select" id="s-deep-model">${buildDeepSeekModelOptionsHtml(g.deepseekModel)}</select></div><div class="field"><label>API 키</label><input class="input" id="s-deep-key" type="password" placeholder="${g.deepseekApiKey?'저장됨 · 변경할 때만 입력':'DeepSeek API Key'}"></div></div>`
             : provider==='firebase'
@@ -12989,8 +13099,8 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
                 : `<div class="section"><div class="section-title">✨ Google Gemini <span class="badge ${g.googleApiKey?'ok':''}">${g.googleApiKey?'● 설정됨':'○ 미설정'}</span></div><div class="grid2"><div class="field"><label>모델</label><select class="select" id="s-google-model">${buildGeminiModelOptionsHtml(g.googleModel)}</select></div><div class="field"><label>추론</label><select class="select" id="s-thinking"><option value="auto" ${g.geminiThinkingMode==='auto'?'selected':''}>자동</option><option value="fast" ${g.geminiThinkingMode==='fast'?'selected':''}>빠름</option><option value="normal" ${g.geminiThinkingMode==='normal'?'selected':''}>보통</option><option value="deep" ${g.geminiThinkingMode==='deep'?'selected':''}>깊게</option></select></div></div><div class="field"><label>API 키</label><input class="input" id="s-google-key" type="password" placeholder="${g.googleApiKey?'저장됨 · 변경할 때만 입력':'Gemini API Key'}"></div></div>`;
 
         h.innerHTML=`<h2 class="page-title">🔌 연결</h2><div class="page-desc">장면 분석 API와 NovelAI 인증을 관리해.</div>
-        <div class="section" style="padding-top:0"><div class="setting-row"><div class="setting-label"><b>장면 분석 API</b><span class="help">ScenePlan을 생성할 때 사용할 API</span></div><select class="select" id="s-provider"><option value="ai-studio" ${provider==='ai-studio'?'selected':''}>Google Gemini API</option><option value="firebase" ${provider==='firebase'?'selected':''}>Firebase AI Logic</option><option value="deepseek" ${provider==='deepseek'?'selected':''}>DeepSeek API</option></select></div><div class="status-line" id="s-conn-status"></div></div>
-        ${providerPanel}
+        <div class="section" style="padding-top:0"><div class="setting-row"><div class="setting-label"><b>장면 분석 API</b><span class="help">ScenePlan을 생성할 때 사용할 API</span></div><select class="select" id="s-provider"><option value="ai-studio" ${provider==='ai-studio'?'selected':''}>Google Gemini API</option><option value="firebase" ${provider==='firebase'?'selected':''}>Firebase AI Logic</option><option value="deepseek" ${provider==='deepseek'?'selected':''}>DeepSeek API</option><option value="openai" ${provider==='openai'?'selected':''}>OpenAI API (GPT)</option></select></div><div class="status-line" id="s-conn-status"></div></div>
+        ${provider==='openai'?openAiPanel:providerPanel}
         <div class="section"><div class="section-title">🎨 NovelAI <span class="badge ${g.naiApiKey?'ok':''}">${g.naiApiKey?'● 설정됨':'○ 미설정'}</span></div><div class="field"><label>영구 API 토큰</label><input class="input" id="s-nai-key" type="password" placeholder="${g.naiApiKey?'저장됨 · 변경할 때만 입력':'NovelAI token'}"></div></div>
         <div class="section"><div class="connection-actions"><button class="btn primary connection-test" id="s-test-scene">선택한 장면 분석 API 테스트</button><button class="btn" id="s-test-nai">NovelAI 테스트</button><div class="grow"></div><button class="btn danger" id="s-clear-creds">인증정보 전체 삭제</button></div></div>`;
 
@@ -13009,9 +13119,9 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
         });
 
         const status=h.querySelector('#s-conn-status');
-        h.querySelector('#s-test-scene').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='장면 분석 API 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const req=getGeminiGenerateContentRequestConfig(draft),data=await requestGeminiGenerateContent(req,{contents:[{role:'user',parts:[{text:'Reply with exactly: OK'}]}],generationConfig:buildGeminiConnectionTestGenerationConfig(req)});if(!extractTextFromGeminiResponseData(data))throw new Error('응답 본문이 비어 있어요.');const providerName=req.provider==='deepseek'?'DeepSeek':req.provider==='firebase'?'Firebase AI Logic':'Google Gemini';status.textContent=`● 연결 정상 · ${providerName} · ${req.model}`;v35Toast(`${providerName} 연결 정상`,'success')}catch(err){status.textContent='! 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
+        h.querySelector('#s-test-scene').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='장면 분석 API 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const req=getGeminiGenerateContentRequestConfig(draft),data=await requestGeminiGenerateContent(req,{contents:[{role:'user',parts:[{text:'Reply with exactly: OK'}]}],generationConfig:buildGeminiConnectionTestGenerationConfig(req)});if(!extractTextFromGeminiResponseData(data))throw new Error('응답 본문이 비어 있어요.');const providerName={openai:'OpenAI',deepseek:'DeepSeek',firebase:'Firebase AI Logic','ai-studio':'Google Gemini'}[req.provider];status.textContent=`● 연결 정상 · ${providerName} · ${req.model}`;v35Toast(`${providerName} 연결 정상`,'success')}catch(err){status.textContent='! 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
         h.querySelector('#s-test-nai').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='NovelAI 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const result=await fetchNaiAnlasBalance(draft.naiApiKey||'');status.textContent=`● NAI 정상 · ${Number(result.total||0).toLocaleString()} Anlas`;v35Toast('NovelAI 연결 정상','success')}catch(err){status.textContent='! NAI 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
-        h.querySelector('#s-clear-creds').onclick=()=>{if(!confirm('Google / DeepSeek / Firebase / NovelAI 인증정보를 모두 삭제할까요?'))return;const cur=getGlobalSettings();saveGlobalSettings({...cur,googleApiKey:'',deepseekApiKey:'',firebaseConfigJson:'',firebaseAppCheckDebugToken:'',naiApiKey:''});v35Toast('인증정보를 삭제했어.','success');renderV35Connections(h)}
+        h.querySelector('#s-clear-creds').onclick=()=>{if(!confirm('Google / DeepSeek / OpenAI / Firebase / NovelAI 인증정보를 모두 삭제할까요?'))return;const cur=getGlobalSettings();saveGlobalSettings({...cur,googleApiKey:'',deepseekApiKey:'',openaiApiKey:'',firebaseConfigJson:'',firebaseAppCheckDebugToken:'',naiApiKey:''});v35Toast('인증정보를 삭제했어.','success');renderV35Connections(h)}
     }
     function renderV35GenerationDefaults(h){
         const g=getGlobalSettings(),s={...getDefaultNaiSettings(),...(g.naiSettings||{})},model=normalizeNaiModel(g.naiModel),fam=getNaiModelCapability(model).family;
