@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.6
+// @version      5.6.7
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.6: OpenAI 추론 강도 위치 안내와 설정 화면 버전 표시.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.7: 다인챗 화자 인식 보강과 스튜디오 등장인물 추가.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -24,7 +24,7 @@
 (function () {
     'use strict';
 
-    const CSP_VERSION = '5.6.6';
+    const CSP_VERSION = '5.6.7';
     const CSP_PREFIX = 'csp_scene_painter';
     const GLOBAL_SETTINGS_KEY = `${CSP_PREFIX}_global_settings`;
     const SECRET_SETTINGS_KEY = `${CSP_PREFIX}_secret_settings_v1`;
@@ -1654,8 +1654,9 @@
 
     function buildCharacterSlotSummaryText(room) {
         return (room.characters || [])
-            .filter(hasCharacterSlotContent)
-            .map((c, i) => `캐릭터 ${i + 1}
+            .map((c, i) => ({ c, i }))
+            .filter(({ c }) => hasCharacterSlotContent(c))
+            .map(({ c, i }) => `캐릭터 ${i + 1}
 slotId: ${getCharacterSlotId(c, i)}
 이름: ${c.name || '(이름 없음)'}
 aliases: ${normalizeCharacterAliases(c.aliases).join(', ') || '(없음)'}
@@ -7661,13 +7662,29 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
 - visualContext의 각 사실에는 value와 basis를 쓰고 basis는 target|recent|state|visualLore|world|inferred 중 하나만 쓴다.
 - director는 tone, visualFocus, spatialIntent, lightingIntent를 포함하며 각 값은 짧은 1문장 이하의 삽화 감독 요약이다.
 - insertAfterParagraph는 ${paragraphRule}.
-- characters는 현재 화면에 실제로 보이는 저장 슬롯만, 최대 ${capability.maxCharacters}명.
-- 각 characters 항목은 characterId, name, present, tags, caption, center, outfit을 포함한다.
+- characters에는 선택한 순간 같은 장소에 있고 프레임에 보이는 저장 캐릭터를 각각 한 항목으로 넣는다. 최대 ${capability.maxCharacters}명.
+- 다인 대화에서는 마지막 화자나 중심 인물을 기준으로 인원수를 제한하지 않는다. 같은 순간 함께 있는 화자와 상대를 확인하고, 함께 보이는 구도를 우선한다. 누가 발화하는 순간이든, 같은 공간에서 계속 대화에 참여하는 인물은 함께 프레임에 배치할 수 있다.
+- 이름이 언급만 되거나 다른 장소·시간에 있는 인물, 전화·메시지로만 등장하는 인물, 화면 밖 PC는 제외한다.
+- 각 characters 항목은 characterId, name, present, tags, caption, center, outfit을 포함한다. characterId와 name은 같은 저장 슬롯에서 복사한다.
 - outfit은 mode(keep|replace|modify), add, remove를 포함한다.
 - pc는 mode(none|pov|visible), fragmentTags, tags, caption, center를 포함한다.
 - composition은 tags와 caption, render는 tags와 caption만 포함한다. globalContext는 새 출력에서 만들지 않는다.
 - legacy visibleCharacters/characterPromptAddon/temporaryOutfitPrompt 필드는 출력하지 않는다.
 - JSON 밖 설명과 Markdown 코드펜스를 쓰지 않는다.`;
+    }
+
+    function formatSceneSpeakerHints(paragraphs, room) {
+        const speakers = paragraphs.flatMap(({ index, text }) => {
+            // 화자명이 따로 있는 문단이나 대사 앞의 이름표만 제시한다. 본문 중간의 이름 언급은 대상이 아니다.
+            const label = text.split(/[:："“「『]/u, 1)[0].trim();
+            const character = findCharacterForDirective(room, { name: label });
+            if (!character) return [];
+            return [{ index, name: getCharacterSlotName(character), characterId: getCharacterSlotId(character, room.characters.indexOf(character)) }];
+        });
+        if (!speakers.length) return '';
+        return `[대상 답변에서 찾은 저장 캐릭터 화자 단서]
+아래 항목은 본문 앞 이름표와 별칭을 맞춘 결과다. 같은 장소·순간에 있는지 확인하고 등장인물에 반영한다.
+${JSON.stringify(speakers)}`;
     }
 
     function buildGeminiUserPrompt({ markdown, room, visualBundle = null }) {
@@ -7694,7 +7711,9 @@ ${visualContextText}
 
 
 [현재 턴 — 지금 삽화를 만드는 AI 답변 전체]
-${String(markdown || '').trim()}
+${cleanMarkdownText(markdown)}
+
+${formatSceneSpeakerHints(paragraphs, room)}
 
 [대상 AI 답변 문단 목록 — 선택할 대상 문단, Hard Facts의 최상위 직접 근거]
 ${JSON.stringify(paragraphs, null, 2)}
@@ -7844,18 +7863,20 @@ ${getScenePlanV2OutputContract(null)}`;
     }
 
     function findCharacterForDirective(room, directive = {}) {
-        const characters = (room?.characters || []).filter(hasCharacterSlotContent);
+        const characters = room?.characters || [];
         const requestedId = String(directive.characterId || directive.slotId || directive.id || '').trim();
-        if (requestedId) {
-            const byId = characters.find((char, index) => getCharacterSlotId(char, index) === requestedId);
-            if (byId) return byId;
-        }
+        const byId = requestedId
+            ? characters.find((char, index) => hasCharacterSlotContent(char) && getCharacterSlotId(char, index) === requestedId)
+            : null;
         const requestedName = normalizeCharacterLookupKey(directive.name || directive.characterName || '');
-        if (!requestedName) return null;
-        return characters.find(char => {
-            const candidates = [getCharacterSlotName(char), ...normalizeCharacterAliases(char.aliases)];
-            return candidates.some(value => normalizeCharacterLookupKey(value) === requestedName);
-        }) || null;
+        if (!requestedName) return byId || null;
+
+        const matches = characters.filter(char => hasCharacterSlotContent(char) &&
+            [getCharacterSlotName(char), ...normalizeCharacterAliases(char.aliases)]
+                .some(value => normalizeCharacterLookupKey(value) === requestedName)
+        );
+        if (matches.length === 1) return matches[0];
+        return matches.length === 0 || matches.includes(byId) ? byId || null : null;
     }
 
     function normalizeOutfitDirective(raw = {}) {
@@ -8115,6 +8136,7 @@ ${getScenePlanV2OutputContract(null)}`;
     }
 
     function buildRefineGeminiUserPrompt({ markdown, room, focusIndex, initialGlobalContext, selectedCharacterName, currentPlan, currentScenePrompt, additionalRequest, visualBundle = null }) {
+        const paragraphs = getParagraphs(markdown);
         const focusWindow = getSceneParagraphWindow(markdown, focusIndex, 1);
         const stableGlobalContext = normalizeGlobalSceneContext({ globalContext: initialGlobalContext || {} });
         const safePlan = currentPlan || {};
@@ -8145,7 +8167,9 @@ ${visualContextText}
 ${JSON.stringify(stableGlobalContext, null, 2)}
 
 [현재 턴 — 지금 삽화를 만드는 AI 답변 전체]
-${String(markdown || '').trim()}
+${cleanMarkdownText(markdown)}
+
+${formatSceneSpeakerHints(paragraphs, room)}
 
 [현재 선택 문단 index]
 ${Number(focusIndex)}
@@ -9037,7 +9061,8 @@ ${JSON.stringify(safePlan, null, 2)}
         const mergedCharacterPrompt = buildCommaPrompt((charState.charPrompts || []).map(char => stripSubjectCountTags(char.prompt || '')));
         const mergedCharacterUc = buildCommaPrompt((charState.charPrompts || []).map(char => char.uc || ''));
 
-        const basePrompt = buildCommaPrompt([fixedPositive, subjectCount, scenePrompt]);
+        const stylePrompt = charState.charPrompts.length > 1 ? removeSceneSubjectCounts(fixedPositive) : fixedPositive;
+        const basePrompt = buildCommaPrompt([stylePrompt, subjectCount, scenePrompt]);
         const baseNegative = fixedNegative;
         const finalPrompt = buildCommaPrompt([basePrompt, mergedCharacterPrompt]);
         const finalNegative = buildCommaPrompt([baseNegative, mergedCharacterUc]);
@@ -11543,6 +11568,14 @@ ${v35GaugeHtml({thin:true,percent:b.charCount/b.maxCharacters*100,tone:'ok'})}</
     const CSP_SUBJECT_COUNT_TAG = /^(?:solo|multiple people|(?:\d+|6\+)(?:girls?|boys?|others?))$/i;
     const cspPromptPresetUi = { id: '', mode: '', draft: null, undo: null };
 
+    function removeSceneSubjectCounts(prompt) {
+        return splitPromptTokens(prompt).filter(tag => {
+            const bare = tag.replace(/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)::\s*/, '')
+                .replace(/::\s*$/, '').trim();
+            return !CSP_SUBJECT_COUNT_TAG.test(bare) && !/^(?:\d+\s*people|multiple (?:boys|girls|others))$/i.test(bare);
+        }).join(', ');
+    }
+
     function makePromptPresetId() {
         if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return `pp-${crypto.randomUUID()}`;
         return `pp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -13372,9 +13405,67 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
         h.querySelector('#a-usage-reset').onclick=()=>{if(!confirm('Gemini 사용량 통계를 초기화할까요?'))return;resetGeminiUsage();renderV35Advanced(h)}
     }
 
-    // Studio Characters panel completion: position editing lives on the actual output canvas.
+    function addV35SceneCharacter(session, room, index) {
+        const character = room.characters[index];
+        const model = v35Model();
+        const existing = session.promptState.charPrompts || [];
+        if (!character || existing.length >= getNaiModelCapability(model).maxCharacters) return false;
+        const characterId = getCharacterSlotId(character, index);
+        if (existing.some(item => item.characterId === characterId || findCharacterForDirective(room, item) === character)) return false;
+
+        const directive = { characterId, name: getCharacterSlotName(character), present: true };
+        const added = buildCharacterPromptState(room, { characters: [directive] }, { naiModel: model }).charPrompts[0];
+        if (!added) return false;
+
+        const request = v35PromptRequest();
+        added.center = makeDefaultCenter(existing.length, existing.length + 1);
+        const charPrompts = [...existing, added];
+        const subjectCount = buildSubjectCountTag(charPrompts.map(item => ({ tags: item.prompt })));
+        const basePrompt = buildCommaPrompt([removeSceneSubjectCounts(request.basePrompt), subjectCount]);
+        Object.assign(session.promptState, {
+            subjectCount, basePrompt, baseNegative: request.baseNegative, charPrompts,
+            characterTags: serializeCharacterPromptsForTextarea(charPrompts),
+            finalPrompt: buildCommaPrompt([basePrompt, ...charPrompts.map(item => stripSubjectCountTags(item.prompt))]),
+            finalNegative: buildCommaPrompt([request.baseNegative, ...charPrompts.map(item => item.uc)])
+        });
+        const characters = existing.filter(item => item.kind !== 'pc').map(item => {
+            const saved = findCharacterForDirective(room, item);
+            return saved ? getPlanDirectiveForCharacter(session.plan, room, saved) || {
+                characterId: getCharacterSlotId(saved, room.characters.indexOf(saved)), name: getCharacterSlotName(saved), present: true
+            } : null;
+        }).filter(Boolean);
+        characters.push(directive);
+        const visibleCharacters = characters.map(item => item.name).filter(Boolean);
+        Object.assign(session.plan, { characters, visibleCharacters, charactersInScene: visibleCharacters, characterCount: charPrompts.length });
+        session.characterDirty = true;
+        return true;
+    }
+
     function v35AugmentCharactersPanel(p){
-        const s=cspV35Session;if(!p||s?.tool!=='characters')return;const chars=s.promptState?.charPrompts||[];if(!chars.length)return;
+        const s = cspV35Session;
+        if (!p || s?.tool !== 'characters') return;
+        const chars = s.promptState?.charPrompts || [];
+        const room = getRoomSettings();
+        const model = v35Model();
+        const choices = room.characters.map((character, index) => ({ character, index })).filter(({ character }) =>
+            stripSubjectCountTags(getCharacterPromptForPlan(character, s.plan))
+            && !chars.some(item => item.kind !== 'pc' && findCharacterForDirective(room, item) === character)
+        );
+        if (choices.length && chars.length < getNaiModelCapability(model).maxCharacters) {
+            const picker = document.createElement('div');
+            picker.className = 'section';
+            picker.innerHTML = `<div class="field"><label for="v35-add-scene-char">장면에 인물 추가</label>
+                <select class="select" id="v35-add-scene-char">${choices.map(({ character, index }) =>
+                    `<option value="${index}">${escapeHtml(getCharacterSlotName(character) || `캐릭터 ${index + 1}`)}</option>`).join('')}</select>
+                <button type="button" class="btn" id="v35-add-scene-char-btn">선택한 인물 추가</button></div>`;
+            p.appendChild(picker);
+            picker.querySelector('#v35-add-scene-char-btn').onclick = () => {
+                if (!['idle', 'ready'].includes(s.status)) return;
+                const index = Number(picker.querySelector('#v35-add-scene-char').value);
+                if (addV35SceneCharacter(s, room, index)) renderV35Studio();
+            };
+        }
+        if (!chars.length) return;
         const actions=document.createElement('div');actions.className='tool-actions';actions.innerHTML=`<button class="btn ${s.positionMode?'primary':''}" id="v35-position-edit">${s.positionMode?'위치 편집 완료':'이미지 위에서 위치 편집'}</button><span class="help">${getNaiModelCapability(v35Model()).coordinateMode==='grid5'?'V4.5 · 5×5':'V5 · 자유 좌표'}</span>`;p.appendChild(actions);
         actions.querySelector('#v35-position-edit').onclick=()=>{s.positionMode=!s.positionMode;if(s.positionMode)s.generation.useCoords=true;renderV35Studio()};
         p.querySelectorAll('[data-scene-char]').forEach(b=>b.onclick=()=>{s.__charEdit=Number(b.dataset.sceneChar);s.inspector='prompt';renderV35Studio()});
