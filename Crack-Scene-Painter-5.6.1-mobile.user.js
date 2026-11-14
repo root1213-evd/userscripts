@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.7
+// @version      5.6.8
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.7: 다인챗 화자 인식 보강과 스튜디오 등장인물 추가.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.8: 모바일 채팅 삽화 버튼을 더보기 메뉴에 모음.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -24,7 +24,7 @@
 (function () {
     'use strict';
 
-    const CSP_VERSION = '5.6.7';
+    const CSP_VERSION = '5.6.8';
     const CSP_PREFIX = 'csp_scene_painter';
     const GLOBAL_SETTINGS_KEY = `${CSP_PREFIX}_global_settings`;
     const SECRET_SETTINGS_KEY = `${CSP_PREFIX}_secret_settings_v1`;
@@ -6033,13 +6033,82 @@ director.lightingIntent:
                 background: rgba(160, 36, 36, 0.86);
                 border-color: rgba(255,120,120,0.40);
             }
-            body.csp-scene-hidden .csp-mobile-message-footer { display: none; }
-            @media (pointer: coarse), (hover: none) {
-                .csp-image-info-row, .csp-image-action-row {
-                    opacity: 1;
+            .csp-image-menu-panel { display: contents; }
+            .csp-image-menu-toggle, .csp-image-action-label { display: none; }
+
+            @media (max-width: 700px), (pointer: coarse), (hover: none) {
+                .csp-generated-scene-image .csp-image-menu-toggle {
+                    position: absolute;
+                    right: 5px;
+                    bottom: 5px;
+                    z-index: 3;
+                    display: grid;
+                    place-items: center;
+                    width: 40px;
+                    height: 38px;
+                    padding: 0;
+                    border: 0;
+                    background: transparent;
+                    color: #fff;
+                    pointer-events: auto;
+                    cursor: pointer;
+                }
+                .csp-image-menu-toggle span {
+                    display: grid;
+                    place-items: center;
+                    width: 28px;
+                    height: 26px;
+                    border: 1px solid rgba(255,255,255,.25);
+                    border-radius: 8px;
+                    background: rgba(18,18,22,.8);
+                    font: 700 19px/1 system-ui, sans-serif;
+                }
+                .csp-image-menu-panel {
+                    display: none;
+                    position: absolute;
+                    right: 10px;
+                    bottom: 46px;
+                    z-index: 4;
+                    width: min(145px, calc(100% - 20px));
+                    max-height: calc(100% - 54px);
+                    overflow-y: auto;
+                    overscroll-behavior: contain;
+                    box-sizing: border-box;
+                    padding: 3px;
+                    border: 1px solid rgba(255,255,255,.22);
+                    border-radius: 10px;
+                    background: #242229;
                     pointer-events: auto;
                 }
-                .csp-image-action-btn { width: 40px; height: 40px; }
+                .csp-image-menu-toggle[aria-expanded="true"] + .csp-image-menu-panel { display: block; }
+                .csp-image-menu-panel .csp-image-info-row,
+                .csp-image-menu-panel .csp-image-action-row { display: contents; }
+                .csp-image-menu-panel .csp-image-action-btn {
+                    display: flex;
+                    justify-content: flex-start;
+                    gap: 8px;
+                    width: 100%;
+                    height: auto;
+                    min-height: 38px;
+                    padding: 5px 7px;
+                    border: 0;
+                    border-radius: 6px;
+                    background: transparent;
+                    box-shadow: none;
+                    backdrop-filter: none;
+                    -webkit-backdrop-filter: none;
+                    transform: none;
+                    font: 500 13px/1.2 system-ui, sans-serif;
+                }
+                .csp-image-menu-panel .csp-image-action-btn:active,
+                .csp-image-menu-panel .csp-image-action-btn:focus-visible { background: rgba(255,255,255,.12); }
+                .csp-image-menu-panel .csp-image-action-btn[data-csp-danger="true"] { color: #ffb8b8; }
+                .csp-image-action-icon { flex: 0 0 18px; text-align: center; }
+                .csp-image-action-label { display: inline; }
+            }
+
+            body.csp-scene-hidden .csp-mobile-message-footer { display: none; }
+            @media (pointer: coarse), (hover: none) {
                 .csp-message-generate-btn, .csp-message-speed-btn, .csp-message-comic-btn {
                     min-width: 38px;
                     min-height: 38px;
@@ -7232,15 +7301,20 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
     }
     function buildCaption(messageKey) {
         if (!messageKey) return '';
+        const key = escapeHtml(messageKey);
+        const action = (name, icon, label, danger = false) =>
+            `<button class="csp-image-action-btn csp-image-${name}-btn" data-message-key="${key}" type="button"
+                title="${label}" aria-label="${label}"${danger ? ' data-csp-danger="true"' : ''}><span class="csp-image-action-icon" aria-hidden="true">${icon}</span><span class="csp-image-action-label">${label}</span></button>`;
         return `
-            <div class="csp-image-info-row" aria-label="Scene Painter image info">
-                <button class="csp-image-action-btn csp-image-info-btn" data-message-key="${escapeHtml(messageKey)}" type="button" title="정보" aria-label="정보">ℹ️</button>
-            </div>
-            <div class="csp-image-action-row" aria-label="Scene Painter image actions">
-                <button class="csp-image-action-btn csp-image-reroll-btn" data-message-key="${escapeHtml(messageKey)}" type="button" title="리롤" aria-label="리롤">↻</button>
-                <button class="csp-image-action-btn csp-image-edit-btn" data-message-key="${escapeHtml(messageKey)}" type="button" title="리롤 설정" aria-label="리롤 설정">⚙️</button>
-                <button class="csp-image-action-btn csp-image-download-btn" data-message-key="${escapeHtml(messageKey)}" type="button" title="저장" aria-label="저장">⬇</button>
-                <button class="csp-image-action-btn csp-image-delete-btn" data-message-key="${escapeHtml(messageKey)}" type="button" title="삭제" aria-label="삭제" data-csp-danger="true">🗑</button>
+            <button class="csp-image-menu-toggle" type="button" aria-label="삽화 더보기" aria-expanded="false"><span aria-hidden="true">⋯</span></button>
+            <div class="csp-image-menu-panel">
+                <div class="csp-image-info-row">${action('info', 'ℹ️', '정보')}</div>
+                <div class="csp-image-action-row">
+                    ${action('reroll', '↻', '리롤')}
+                    ${action('edit', '⚙️', '리롤 설정')}
+                    ${action('download', '⬇', '저장')}
+                    ${action('delete', '🗑', '삭제', true)}
+                </div>
             </div>
         `;
     }
@@ -9652,9 +9726,30 @@ ${JSON.stringify(safePlan, null, 2)}
         showToast(`🖼️ 문단 ${result.index + 1} 뒤에 삽입 완료`);
     }
 
+    let cspOpenImageMenu = null;
+
+    function closeCspImageMenu() {
+        cspOpenImageMenu?.setAttribute('aria-expanded', 'false');
+        cspOpenImageMenu = null;
+    }
+
     async function handleImageAction(event) {
         const target = event.target;
         if (!target || !target.closest) return;
+
+        const menuToggle = target.closest('.csp-image-menu-toggle');
+        if (menuToggle) {
+            event.preventDefault();
+            event.stopPropagation();
+            const wasOpen = menuToggle === cspOpenImageMenu;
+            closeCspImageMenu();
+            if (!wasOpen) {
+                menuToggle.setAttribute('aria-expanded', 'true');
+                cspOpenImageMenu = menuToggle;
+            }
+            return;
+        }
+        if (cspOpenImageMenu && !cspOpenImageMenu.nextElementSibling?.contains(target)) closeCspImageMenu();
 
         const messageButton = target.closest('.csp-message-generate-btn, .csp-message-speed-btn, .csp-message-comic-btn');
         if (messageButton) {
@@ -9708,8 +9803,12 @@ ${JSON.stringify(safePlan, null, 2)}
             return;
         }
 
-        if (!actionBtn) return;
+        if (!actionBtn || actionBtn.disabled) return;
 
+        if (cspOpenImageMenu?.nextElementSibling?.contains(actionBtn)) {
+            if (event.detail === 0) cspOpenImageMenu.focus({ preventScroll: true });
+            closeCspImageMenu();
+        }
         event.preventDefault();
         event.stopPropagation();
         if (event.stopImmediatePropagation) event.stopImmediatePropagation();
@@ -9797,6 +9896,14 @@ ${JSON.stringify(safePlan, null, 2)}
         if (cspImageActionsBound) return;
         cspImageActionsBound = true;
         document.addEventListener('click', handleImageAction, true);
+        document.addEventListener('keydown', event => {
+            if (event.key !== 'Escape' || !cspOpenImageMenu?.isConnected) return;
+            const toggle = cspOpenImageMenu;
+            closeCspImageMenu();
+            toggle.focus({ preventScroll: true });
+            event.preventDefault();
+            event.stopPropagation();
+        }, true);
     }
 
     async function runMessagePlanAnalysis({ bubble, markdown, button }) {
@@ -13486,8 +13593,13 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
         if(cspQuickRerollTasks.has(taskKey))return null;
         const controller=new AbortController();
         cspQuickRerollTasks.set(taskKey,controller);
-        const oldText=button?.textContent;
-        if(button){button.disabled=true;button.dataset.cspLoading='true';button.textContent='⏳';}
+        const icon = button?.querySelector('.csp-image-action-icon');
+        const oldIcon = icon?.textContent;
+        if (button) {
+            button.disabled = true;
+            button.dataset.cspLoading = 'true';
+            if (icon) icon.textContent = '⏳';
+        }
         try {
             const record=getSceneRecords()[messageKey];
             if(!record)throw new Error('리롤할 이미지 기록을 찾지 못했어요.');
@@ -13522,7 +13634,11 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
             return null;
         } finally {
             cspQuickRerollTasks.delete(taskKey);
-            if(button){button.disabled=false;delete button.dataset.cspLoading;button.textContent=oldText;}
+            if (button) {
+                button.disabled = false;
+                delete button.dataset.cspLoading;
+                if (icon) icon.textContent = oldIcon;
+            }
             if(roomId===getRoomId())refreshImageActionState(messageKey,box);
         }
     }
