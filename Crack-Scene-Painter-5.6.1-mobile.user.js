@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.5
+// @version      5.6.6
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.5: OpenAI 모델별 추론 강도 설정 추가.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.6: OpenAI 추론 강도 위치 안내와 설정 화면 버전 표시.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -24,6 +24,7 @@
 (function () {
     'use strict';
 
+    const CSP_VERSION = '5.6.6';
     const CSP_PREFIX = 'csp_scene_painter';
     const GLOBAL_SETTINGS_KEY = `${CSP_PREFIX}_global_settings`;
     const SECRET_SETTINGS_KEY = `${CSP_PREFIX}_secret_settings_v1`;
@@ -12069,7 +12070,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
         const endDrag=e=>{if(!state.drag)return;state.drag=false;main.classList.remove('is-dragging');try{if(e?.pointerId!=null&&main.hasPointerCapture?.(e.pointerId))main.releasePointerCapture(e.pointerId)}catch(_){}};
         main.addEventListener('pointerup',endDrag);main.addEventListener('pointercancel',endDrag);main.addEventListener('lostpointercapture',()=>{state.drag=false;main.classList.remove('is-dragging')})
     }
-    function openV35Settings(page=''){if(page)patchV35Ui('settings',{page});const cur=getV35UiState().settings.page||'connection',{root,app}=mountV35('settings');root.dataset.view='settings';const pages=[['connection','🔌 연결'],['characters','🎭 캐릭터'],['world','🌍 세계관 & 설정'],['generation','🎨 생성'],['storage','💾 저장'],['advanced','🛠 고급']];app.innerHTML=`<div class="v35-top"><div class="v35-brand">⚙ Scene Painter <small>설정</small></div><div class="grow"></div><span class="help" id="v35-save-state">저장됨</span><button class="iconbtn" id="v35-s-close">×</button></div><div class="settings-body"><nav class="settings-nav">${pages.map(([id,l])=>`<button class="navbtn ${cur===id?'active':''}" data-spage="${id}">${l}</button>`).join('')}<div class="grow"></div></nav><main class="settings-content"><div class="settings-page" id="v35-settings-page"></div></main></div>`;root.querySelector('#v35-s-close').onclick=()=>cspV35Session?renderV35Studio():closeV35();root.querySelectorAll('[data-spage]').forEach(b=>b.addEventListener('click',()=>{patchV35Ui('settings',{page:b.dataset.spage});openV35Settings()}));renderV35SettingsPage(root,cur)}
+    function openV35Settings(page=''){if(page)patchV35Ui('settings',{page});const cur=getV35UiState().settings.page||'connection',{root,app}=mountV35('settings');root.dataset.view='settings';const pages=[['connection','🔌 연결'],['characters','🎭 캐릭터'],['world','🌍 세계관 & 설정'],['generation','🎨 생성'],['storage','💾 저장'],['advanced','🛠 고급']];app.innerHTML=`<div class="v35-top"><div class="v35-brand">⚙ Scene Painter</div><span class="badge" id="v35-settings-version">v${CSP_VERSION}</span><div class="grow"></div><span class="help" id="v35-save-state">저장됨</span><button class="iconbtn" id="v35-s-close">×</button></div><div class="settings-body"><nav class="settings-nav">${pages.map(([id,l])=>`<button class="navbtn ${cur===id?'active':''}" data-spage="${id}">${l}</button>`).join('')}<div class="grow"></div></nav><main class="settings-content"><div class="settings-page" id="v35-settings-page"></div></main></div>`;root.querySelector('#v35-s-close').onclick=()=>cspV35Session?renderV35Studio():closeV35();root.querySelectorAll('[data-spage]').forEach(b=>b.addEventListener('click',()=>{patchV35Ui('settings',{page:b.dataset.spage});openV35Settings()}));renderV35SettingsPage(root,cur)}
     function v35Saved(text='저장됨 · 방금'){const e=cspV35Root?.querySelector('#v35-save-state');if(e){e.textContent=text;setTimeout(()=>{if(e.isConnected)e.textContent='저장됨'},2200)}}
     function v35SaveGlobal(patch){const n={...getGlobalSettings(),...(patch||{})};saveGlobalSettings(n);v35Saved();return n}
     function saveV35Vc(value){
@@ -13198,7 +13199,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
                 : `<div class="section"><div class="section-title">✨ Google Gemini <span class="badge ${g.googleApiKey?'ok':''}">${g.googleApiKey?'● 설정됨':'○ 미설정'}</span></div><div class="grid2"><div class="field"><label>모델</label><select class="select" id="s-google-model">${buildGeminiModelOptionsHtml(g.googleModel)}</select></div><div class="field"><label>추론</label><select class="select" id="s-thinking"><option value="auto" ${g.geminiThinkingMode==='auto'?'selected':''}>자동</option><option value="fast" ${g.geminiThinkingMode==='fast'?'selected':''}>빠름</option><option value="normal" ${g.geminiThinkingMode==='normal'?'selected':''}>보통</option><option value="deep" ${g.geminiThinkingMode==='deep'?'selected':''}>깊게</option></select></div></div><div class="field"><label>API 키</label><input class="input" id="s-google-key" type="password" placeholder="${g.googleApiKey?'저장됨 · 변경할 때만 입력':'Gemini API Key'}"></div></div>`;
 
         h.innerHTML=`<h2 class="page-title">🔌 연결</h2><div class="page-desc">장면 분석 API와 NovelAI 인증을 관리해.</div>
-        <div class="section" style="padding-top:0"><div class="setting-row"><div class="setting-label"><b>장면 분석 API</b><span class="help">ScenePlan을 생성할 때 사용할 API</span></div><select class="select" id="s-provider"><option value="ai-studio" ${provider==='ai-studio'?'selected':''}>Google Gemini API</option><option value="firebase" ${provider==='firebase'?'selected':''}>Firebase AI Logic</option><option value="deepseek" ${provider==='deepseek'?'selected':''}>DeepSeek API</option><option value="openai" ${provider==='openai'?'selected':''}>OpenAI API (GPT)</option></select></div><div class="status-line" id="s-conn-status"></div></div>
+        <div class="section" style="padding-top:0"><div class="setting-row"><div class="setting-label"><b>장면 분석 API</b><span class="help">ScenePlan을 생성할 때 사용할 API</span></div><select class="select" id="s-provider"><option value="ai-studio" ${provider==='ai-studio'?'selected':''}>Google Gemini API</option><option value="firebase" ${provider==='firebase'?'selected':''}>Firebase AI Logic</option><option value="deepseek" ${provider==='deepseek'?'selected':''}>DeepSeek API</option><option value="openai" ${provider==='openai'?'selected':''}>OpenAI API (GPT)</option></select></div><div class="status-line" id="s-conn-status"></div>${provider!=='openai'?'<div class="help">GPT 추론 강도를 고르려면 위에서 OpenAI API (GPT)를 선택해줘.</div>':''}</div>
         ${provider==='openai'?openAiPanel:providerPanel}
         <div class="section"><div class="section-title">🎨 NovelAI <span class="badge ${g.naiApiKey?'ok':''}">${g.naiApiKey?'● 설정됨':'○ 미설정'}</span></div><div class="field"><label>영구 API 토큰</label><input class="input" id="s-nai-key" type="password" placeholder="${g.naiApiKey?'저장됨 · 변경할 때만 입력':'NovelAI token'}"></div></div>
         <div class="section"><div class="connection-actions"><button class="btn primary connection-test" id="s-test-scene">선택한 장면 분석 API 테스트</button><button class="btn" id="s-test-nai">NovelAI 테스트</button><div class="grow"></div><button class="btn danger" id="s-clear-creds">인증정보 전체 삭제</button></div></div>`;
