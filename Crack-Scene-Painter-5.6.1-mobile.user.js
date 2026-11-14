@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.4
+// @version      5.6.5
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.4: NovelAI 배터리 새로고침 표시 및 생성 설정 접기 지원.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.5: OpenAI 모델별 추론 강도 설정 추가.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -241,6 +241,15 @@
     }
 
     const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
+    const OPENAI_DEFAULT_REASONING_EFFORT = 'low';
+    const OPENAI_REASONING_LABELS = Object.freeze({
+        none: '끄기',
+        low: '낮음',
+        medium: '보통',
+        high: '높음',
+        xhigh: '매우 높음',
+        max: '최대'
+    });
     const OPENAI_MODELS = Object.freeze({
         'gpt-6-luna': 'GPT-6 Luna',
         'gpt-6.1-sol': 'GPT-6.1 Sol',
@@ -251,6 +260,25 @@
     function normalizeOpenAiModelId(model) {
         const id = String(model || '').trim().toLowerCase();
         return Object.hasOwn(OPENAI_MODELS, id) ? id : OPENAI_DEFAULT_MODEL;
+    }
+
+    function getOpenAiReasoningEfforts(model) {
+        const id = normalizeOpenAiModelId(model);
+        return Object.keys(OPENAI_REASONING_LABELS).filter(effort =>
+            effort !== 'none' || id === 'gpt-6-luna' || id === 'gpt-6.1-terra'
+        );
+    }
+
+    function normalizeOpenAiReasoningEffort(effort, model) {
+        const value = String(effort || '').trim().toLowerCase();
+        return getOpenAiReasoningEfforts(model).includes(value) ? value : OPENAI_DEFAULT_REASONING_EFFORT;
+    }
+
+    function buildOpenAiReasoningOptionsHtml(model, effort) {
+        const selected = normalizeOpenAiReasoningEffort(effort, model);
+        return getOpenAiReasoningEfforts(model).map(value =>
+            `<option value="${value}" ${value === selected ? 'selected' : ''}>${OPENAI_REASONING_LABELS[value]} (${value})</option>`
+        ).join('');
     }
 
     function buildOpenAiModelOptionsHtml(model) {
@@ -778,7 +806,7 @@
                 model: requestConfig.model,
                 input,
                 store: false,
-                reasoning: { effort: 'low' },
+                reasoning: { effort: requestConfig.reasoningEffort },
                 max_output_tokens: configuredLimit > 0 ? Math.floor(configuredLimit) : 16384,
                 ...(wantsJson ? { text: { format: { type: 'json_object' } } } : {})
             },
@@ -988,9 +1016,11 @@
                 throw new Error('OpenAI API 키가 비어 있어요. 연결 설정에서 OpenAI API 키를 입력해줘.');
             }
             headers.Authorization = `Bearer ${apiKey}`;
+            const model = normalizeOpenAiModelId(global?.openaiModel);
             return {
                 provider,
-                model: normalizeOpenAiModelId(global?.openaiModel),
+                model,
+                reasoningEffort: normalizeOpenAiReasoningEffort(global?.openaiReasoningEffort, model),
                 headers,
                 url: 'https://api.openai.com/v1/responses'
             };
@@ -2367,6 +2397,7 @@ director.lightingIntent:
             deepseekModel: 'deepseek-v4-flash',
             openaiApiKey: '',
             openaiModel: OPENAI_DEFAULT_MODEL,
+            openaiReasoningEffort: OPENAI_DEFAULT_REASONING_EFFORT,
             geminiThinkingMode: 'auto',
             firebaseConfigJson: '',
             firebaseAppCheckDebugToken: '',
@@ -2612,6 +2643,7 @@ director.lightingIntent:
             : normalizeSceneAnalyzerProvider(rawProvider);
         merged.deepseekModel = normalizeDeepSeekModelId(merged.deepseekModel);
         merged.openaiModel = normalizeOpenAiModelId(merged.openaiModel);
+        merged.openaiReasoningEffort = normalizeOpenAiReasoningEffort(merged.openaiReasoningEffort, merged.openaiModel);
         delete merged.vertexProjectId;
         delete merged.vertexLocation;
         delete merged.vertexAccessToken;
@@ -13124,12 +13156,17 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
     }
 
     function v35ConnectionDraft(h,{preserveSecrets=true}={}){
-        const g=getGlobalSettings();return {...g,
+        const g=getGlobalSettings();
+        const openaiModel = normalizeOpenAiModelId(h.querySelector('#s-openai-model')?.value || g.openaiModel);
+        return {...g,
             geminiProvider:normalizeSceneAnalyzerProvider(h.querySelector('#s-provider')?.value||g.geminiProvider),
             googleModel:normalizeGeminiModelId(h.querySelector('#s-google-model')?.value||g.googleModel),
             geminiThinkingMode:normalizeGeminiThinkingMode(h.querySelector('#s-thinking')?.value||g.geminiThinkingMode),
             deepseekModel:normalizeDeepSeekModelId(h.querySelector('#s-deep-model')?.value||g.deepseekModel),
-            openaiModel:normalizeOpenAiModelId(h.querySelector('#s-openai-model')?.value||g.openaiModel),
+            openaiModel,
+            openaiReasoningEffort: normalizeOpenAiReasoningEffort(
+                h.querySelector('#s-openai-effort')?.value || g.openaiReasoningEffort, openaiModel
+            ),
             // Firebase 칸은 Firebase를 골랐을 때만 그려지므로, 칸이 없으면 저장된 리전/SDK를 그대로 둔다.
             firebaseLocation:(h.querySelector('#s-floc')?h.querySelector('#s-floc').value.trim():g.firebaseLocation)||'global',firebaseSdkVersion:(h.querySelector('#s-fsdk')?h.querySelector('#s-fsdk').value.trim():g.firebaseSdkVersion)||'12.5.0',
             googleApiKey:h.querySelector('#s-google-key')?.value.trim()||(preserveSecrets?g.googleApiKey:''),
@@ -13146,6 +13183,9 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
             <div class="section-title">OpenAI <span class="badge ${g.openaiApiKey?'ok':''}">${g.openaiApiKey?'● 설정됨':'○ 미설정'}</span></div>
             <div class="field"><label for="s-openai-model">모델</label>
                 <select class="select" id="s-openai-model">${buildOpenAiModelOptionsHtml(g.openaiModel)}</select>
+            </div>
+            <div class="field"><label for="s-openai-effort">추론 강도</label>
+                <select class="select" id="s-openai-effort">${buildOpenAiReasoningOptionsHtml(g.openaiModel, g.openaiReasoningEffort)}</select>
             </div>
             <div class="field"><label for="s-openai-key">API 키</label>
                 <input class="input" id="s-openai-key" type="password" autocomplete="off" spellcheck="false" placeholder="${g.openaiApiKey?'저장됨 · 변경할 때만 입력':'OpenAI API Key'}">
@@ -13166,7 +13206,22 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
         let timer=0;
         const save=()=>{clearTimeout(timer);timer=setTimeout(()=>{saveGlobalSettings(v35ConnectionDraft(h));v35Saved()},250)};
         h.querySelectorAll('input,textarea').forEach(x=>x.addEventListener('change',save));
-        h.querySelectorAll('select:not(#s-provider)').forEach(x=>x.addEventListener('change',save));
+        h.querySelectorAll('select:not(#s-provider,#s-openai-model,#s-openai-effort)').forEach(x=>x.addEventListener('change',save));
+
+        const openAiModel = h.querySelector('#s-openai-model');
+        const openAiEffort = h.querySelector('#s-openai-effort');
+        if (openAiModel && openAiEffort) {
+            const saveOpenAiSelection = () => {
+                clearTimeout(timer);
+                saveGlobalSettings(v35ConnectionDraft(h));
+                v35Saved();
+            };
+            openAiModel.addEventListener('change', () => {
+                openAiEffort.innerHTML = buildOpenAiReasoningOptionsHtml(openAiModel.value, openAiEffort.value);
+                saveOpenAiSelection();
+            });
+            openAiEffort.addEventListener('change', saveOpenAiSelection);
+        }
 
         h.querySelector('#s-provider').addEventListener('change',()=>{
             clearTimeout(timer);
@@ -13178,7 +13233,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
         });
 
         const status=h.querySelector('#s-conn-status');
-        h.querySelector('#s-test-scene').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='장면 분석 API 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const req=getGeminiGenerateContentRequestConfig(draft),data=await requestGeminiGenerateContent(req,{contents:[{role:'user',parts:[{text:'Reply with exactly: OK'}]}],generationConfig:buildGeminiConnectionTestGenerationConfig(req)});if(!extractTextFromGeminiResponseData(data))throw new Error('응답 본문이 비어 있어요.');const providerName={openai:'OpenAI',deepseek:'DeepSeek',firebase:'Firebase AI Logic','ai-studio':'Google Gemini'}[req.provider];status.textContent=`● 연결 정상 · ${providerName} · ${req.model}`;v35Toast(`${providerName} 연결 정상`,'success')}catch(err){status.textContent='! 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
+        h.querySelector('#s-test-scene').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='장면 분석 API 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const req=getGeminiGenerateContentRequestConfig(draft);if(req.provider==='openai')req.reasoningEffort=OPENAI_DEFAULT_REASONING_EFFORT;const data=await requestGeminiGenerateContent(req,{contents:[{role:'user',parts:[{text:'Reply with exactly: OK'}]}],generationConfig:buildGeminiConnectionTestGenerationConfig(req)});if(!extractTextFromGeminiResponseData(data))throw new Error('응답 본문이 비어 있어요.');const providerName={openai:'OpenAI',deepseek:'DeepSeek',firebase:'Firebase AI Logic','ai-studio':'Google Gemini'}[req.provider];status.textContent=`● 연결 정상 · ${providerName} · ${req.model}`;v35Toast(`${providerName} 연결 정상`,'success')}catch(err){status.textContent='! 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
         h.querySelector('#s-test-nai').onclick=async e=>{const b=e.currentTarget,old=b.textContent;b.disabled=true;b.textContent='확인 중…';status.textContent='NovelAI 연결 확인 중…';try{const draft=v35ConnectionDraft(h);saveGlobalSettings(draft);const result=await fetchNaiAnlasBalance(draft.naiApiKey||'');status.textContent=`● NAI 정상 · ${Number(result.total||0).toLocaleString()} Anlas`;v35Toast('NovelAI 연결 정상','success')}catch(err){status.textContent='! NAI 연결 실패 · '+(err?.message||err);v35Toast(status.textContent,'error',0)}finally{b.disabled=false;b.textContent=old}};
         h.querySelector('#s-clear-creds').onclick=()=>{if(!confirm('Google / DeepSeek / OpenAI / Firebase / NovelAI 인증정보를 모두 삭제할까요?'))return;const cur=getGlobalSettings();saveGlobalSettings({...cur,googleApiKey:'',deepseekApiKey:'',openaiApiKey:'',firebaseConfigJson:'',firebaseAppCheckDebugToken:'',naiApiKey:''});v35Toast('인증정보를 삭제했어.','success');renderV35Connections(h)}
     }
