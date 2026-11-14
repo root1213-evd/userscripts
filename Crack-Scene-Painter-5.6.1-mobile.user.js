@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.1
+// @version      5.6.2
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.1: 좁은 화면과 터치 입력 지원.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.6.2: 플로팅 버튼 제거, 크랙 설정 메뉴에서 삽화 설정과 갤러리 접근.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -5900,50 +5900,6 @@ director.lightingIntent:
                 background: rgba(160, 36, 36, 0.86);
                 border-color: rgba(255,120,120,0.40);
             }
-            #csp-mobile-launcher {
-                position: fixed;
-                right: max(12px, env(safe-area-inset-right));
-                bottom: calc(88px + env(safe-area-inset-bottom));
-                z-index: 1000;
-                color: #fff;
-                font: 14px/1.4 system-ui, sans-serif;
-            }
-            #csp-mobile-launcher summary,
-            #csp-mobile-launcher .csp-mobile-menu {
-                background: #23202e;
-                color: #fff;
-                border: 1px solid #777186;
-                box-shadow: 0 4px 16px #0004;
-            }
-            #csp-mobile-launcher summary {
-                display: grid;
-                place-items: center;
-                width: 44px;
-                height: 44px;
-                border-radius: 50%;
-                list-style: none;
-                cursor: pointer;
-            }
-            #csp-mobile-launcher summary::-webkit-details-marker { display: none; }
-            #csp-mobile-launcher .csp-mobile-menu {
-                position: absolute;
-                right: 0;
-                bottom: calc(100% + 6px);
-                min-width: 145px;
-                display: grid;
-                padding: 4px 8px;
-                border-radius: 10px;
-            }
-            #csp-mobile-launcher button,
-            #csp-mobile-launcher label {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                min-height: 44px;
-                background: none;
-                color: inherit;
-            }
-            #csp-mobile-launcher:not([open]) .csp-mobile-menu { display: none; }
             body.csp-scene-hidden .csp-mobile-message-footer { display: none; }
             @media (pointer: coarse), (hover: none) {
                 .csp-image-info-row, .csp-image-action-row {
@@ -6002,7 +5958,6 @@ director.lightingIntent:
             '.csp-generated-scene-image',
             '.csp-image-history-row',
             '.csp-inline-action-footer',
-            '#csp-mobile-launcher',
             '.csp-message-generate-btn',
             '.csp-message-speed-btn',
             '.csp-message-comic-btn',
@@ -10299,40 +10254,9 @@ ${JSON.stringify(safePlan, null, 2)}
         applySceneVisibilityState(next);
         const row = document.getElementById('csp-scene-painter-row');
         setSwitchVisual(row?.querySelector('button[role="switch"]'), row?.querySelector('.pointer-events-none'), next);
-        const mobileToggle = document.getElementById('csp-mobile-toggle');
-        if (mobileToggle) mobileToggle.checked = next;
         if (next) scheduleInject();
         else document.querySelectorAll('.csp-message-generate-btn').forEach(btn => btn.remove());
         showToast(next ? '🎨 AI 삽화 생성 ON' : '⏸️ AI 삽화 생성 OFF');
-    }
-
-    function ensureCspMobileLauncher() {
-        let launcher = document.getElementById('csp-mobile-launcher');
-        if (!cspCompactLayout.matches || getRoomId() === 'global_room') {
-            launcher?.remove();
-            return;
-        }
-        if (launcher) return;
-
-        launcher = document.createElement('details');
-        launcher.id = 'csp-mobile-launcher';
-        launcher.innerHTML = `<summary aria-label="Scene Painter">🎨</summary>
-            <div class="csp-mobile-menu">
-                <button type="button" data-csp-mobile="settings">설정</button>
-                <button type="button" data-csp-mobile="gallery">갤러리</button>
-                <label><input type="checkbox" id="csp-mobile-toggle"> 삽화 표시</label>
-            </div>`;
-        const toggle = launcher.querySelector('#csp-mobile-toggle');
-        toggle.checked = isEnabled();
-        toggle.addEventListener('change', () => toggleCspEnabled(toggle.checked));
-        launcher.addEventListener('click', event => {
-            const action = event.target.closest('[data-csp-mobile]')?.dataset.cspMobile;
-            if (!action) return;
-            launcher.open = false;
-            if (action === 'settings') openV35Settings();
-            else openV35Gallery();
-        });
-        document.body.appendChild(launcher);
     }
 
     function createScenePainterRow(originContainer) {
@@ -10454,7 +10378,6 @@ ${JSON.stringify(safePlan, null, 2)}
     function injectAll() {
         injectStyles();
         injectScenePainterRow();
-        ensureCspMobileLauncher();
         injectMessageButtons();
     }
 
