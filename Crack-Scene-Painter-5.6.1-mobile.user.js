@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.7.0
+// @version      5.7.1
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.7.0: OpenAI 추론 강도를 Low, Medium, Max로 정리.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.7.1: 한 답변에서 최대 세 장 생성 및 장면별 문단에 표시.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -24,7 +24,7 @@
 (function () {
     'use strict';
 
-    const CSP_VERSION = '5.7.0';
+    const CSP_VERSION = '5.7.1';
     const CSP_PREFIX = 'csp_scene_painter';
     const GLOBAL_SETTINGS_KEY = `${CSP_PREFIX}_global_settings`;
     const SECRET_SETTINGS_KEY = `${CSP_PREFIX}_secret_settings_v1`;
@@ -3007,6 +3007,7 @@ director.lightingIntent:
     function compactHistoryItemForStorage(item = {}) {
         const compact = {};
         if (item.outputKind) compact.outputKind = item.outputKind;
+        if (Number.isInteger(item.paragraphIndex) && item.paragraphIndex >= 0) compact.paragraphIndex = item.paragraphIndex;
         if (item.imageId) compact.imageId = item.imageId;
         // IndexedDB로 아직 옮기지 못한(imageId 없는) 예전 data URL은 유일한 사본이라 남긴다. blob URL은 새로고침 후 깨지므로 버린다.
         if (item.imageUrl && !String(item.imageUrl).startsWith('blob:') && !(item.imageId && String(item.imageUrl).startsWith('data:'))) {
@@ -3268,7 +3269,10 @@ director.lightingIntent:
         const full = !!effectiveRecord && isSceneHistoryFull(effectiveRecord);
         const count = effectiveRecord ? getSceneHistoryCount(effectiveRecord) : 0;
 
-        targetBox.querySelectorAll('.csp-image-reroll-btn, .csp-image-edit-btn').forEach(btn => {
+        const selector = `.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"]`;
+        const boxes = targetBox.parentElement ? Array.from(targetBox.parentElement.querySelectorAll(selector)) : [targetBox];
+        const buttons = boxes.flatMap(group => Array.from(group.querySelectorAll('.csp-image-reroll-btn, .csp-image-edit-btn')));
+        buttons.forEach(btn => {
             btn.disabled = full;
             btn.classList.toggle('is-disabled', full);
             if (btn.classList.contains('csp-image-edit-btn')) {
@@ -3284,8 +3288,10 @@ director.lightingIntent:
             }
         });
 
-        targetBox.setAttribute('data-csp-history-count', String(count));
-        targetBox.setAttribute('data-csp-history-full', full ? 'true' : 'false');
+        boxes.forEach(group => {
+            group.setAttribute('data-csp-history-count', String(count));
+            group.setAttribute('data-csp-history-full', full ? 'true' : 'false');
+        });
     }
 
     async function getRecordImageSrc(record, index = null) {
@@ -3302,7 +3308,7 @@ director.lightingIntent:
         return '';
     }
 
-    async function appendSceneHistoryImage(messageKey, record, imageUrl, roomId = getRoomId()) {
+    async function appendSceneHistoryImage(messageKey, record, imageUrl, roomId = getRoomId(), paragraphIndex = record.paragraphIndex) {
         normalizeSceneRecordHistory(record, messageKey);
         if (!imageUrl) return null;
         record.history = Array.isArray(record.history) ? record.history : [];
@@ -3312,6 +3318,7 @@ director.lightingIntent:
         }
 
         const item = { createdAt: Date.now(), outputKind: record.plan?.outputKind || 'illustration' };
+        if (Number.isInteger(paragraphIndex) && paragraphIndex >= 0) item.paragraphIndex = paragraphIndex;
         if (String(imageUrl).startsWith('data:')) {
             item.imageId = makeHistoryImageId(messageKey, roomId);
             await putStoredImage(item.imageId, imageUrl);
@@ -3326,10 +3333,10 @@ director.lightingIntent:
         return item;
     }
 
-    async function commitGeneratedImageReroll({ messageKey, record, imageUrl, plan, promptState, settings, box = null, img = null, mode = 'nai', roomId = getRoomId() }) {
+    async function commitGeneratedImageReroll({ messageKey, record, imageUrl, plan, promptState, settings, box = null, mode = 'nai', roomId = getRoomId() }) {
         if (!messageKey || !record) throw new Error('리롤 기록을 찾지 못했어요.');
         if (!imageUrl) throw new Error('리롤 이미지 결과가 비어 있어요.');
-        const currentHistoryItem = await appendSceneHistoryImage(messageKey, record, imageUrl, roomId);
+        const currentHistoryItem = await appendSceneHistoryImage(messageKey, record, imageUrl, roomId, plan?.insertAfterParagraph ?? record.paragraphIndex);
         const finalPlan = Object.assign({}, plan || record.plan || {});
         const finalCharPrompts = Array.isArray(promptState?.charPrompts) ? promptState.charPrompts : [];
 
@@ -3368,18 +3375,7 @@ director.lightingIntent:
             }).catch(err => console.warn('[Crack Scene Painter] comic mixer source archive failed:', err));
         }
         if (roomId !== getRoomId()) return currentHistoryItem;
-        if (box && !box.isConnected) box = null;
-        if (img && !img.isConnected) img = null;
-
-        const targetImg = img || box?.querySelector?.('img');
-        if (targetImg && imageUrl) targetImg.src = imageUrl;
-
-        const caption = box?.querySelector?.('.csp-generated-scene-caption');
-        if (caption) {
-            caption.innerHTML = buildCaption(messageKey);
-        }
-
-        refreshImageHistoryControls(messageKey, box, record);
+        await refreshInlineSceneImages(messageKey, box, record, imageUrl);
         return currentHistoryItem;
     }
 
@@ -3402,79 +3398,122 @@ director.lightingIntent:
         }
     }
 
-    function buildImageHistoryControls(messageKey, record) {
-        normalizeSceneRecordHistory(record, messageKey);
-        const history = Array.isArray(record?.history) ? record.history : [];
-        const count = history.length;
-        if (count <= 1) return '';
-        const index = clampHistoryIndex(record);
-
-        return `
-            <button class="csp-image-history-btn csp-image-history-prev" data-message-key="${escapeHtml(messageKey)}" type="button" title="이전 이미지" aria-label="이전 이미지" ${index <= 0 ? 'disabled' : ''}>‹</button>
-            <span class="csp-image-history-count">${index + 1} / ${count}</span>
-            <button class="csp-image-history-btn csp-image-history-next" data-message-key="${escapeHtml(messageKey)}" type="button" title="다음 이미지" aria-label="다음 이미지" ${index >= count - 1 ? 'disabled' : ''}>›</button>
-        `;
+    function matchesInlineSceneItem(card, item) {
+        if (!item) return false;
+        const saved = card.__cspImageItem;
+        return item.imageId
+            ? saved?.imageId === item.imageId
+            : !saved?.imageId && saved?.imageUrl === item.imageUrl && saved?.createdAt === item.createdAt;
     }
 
-    function ensureImageHistoryRow(box) {
-        if (!box) return null;
-        const messageKey = box.getAttribute('data-message-key') || '';
-        let row = messageKey
-            ? document.querySelector(`.csp-image-history-row[data-message-key="${CSS.escape(messageKey)}"]`)
-            : null;
-
-        if (!row) {
-            const next = box.nextElementSibling;
-            if (next?.classList?.contains('csp-image-history-row')) row = next;
-        }
-
-        if (!row) {
-            row = document.createElement('div');
-            row.className = 'csp-image-history-row';
-            if (messageKey) row.setAttribute('data-message-key', messageKey);
-            box.insertAdjacentElement('afterend', row);
-        }
-
-        return row;
+    async function getInlineScenePlacements(record) {
+        return Promise.all(record.history.map(async item => {
+            if (Number.isInteger(item.paragraphIndex) && item.paragraphIndex >= 0) return item.paragraphIndex;
+            const archive = item.promptArchiveId
+                ? await getRecordPromptArchive({ promptArchiveId: item.promptArchiveId })
+                : null;
+            return archive?.plan?.insertAfterParagraph ?? record.paragraphIndex ?? 0;
+        }));
     }
 
-    function refreshImageHistoryControls(messageKey, box = null, record = null) {
-        const targetBox = box || document.querySelector(`.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"]`);
-        const row = ensureImageHistoryRow(targetBox);
-        if (!row) return;
-        const effectiveRecord = record || getSceneRecords()[messageKey];
-        row.innerHTML = effectiveRecord ? buildImageHistoryControls(messageKey, effectiveRecord) : '';
-        refreshImageActionState(messageKey, targetBox, effectiveRecord);
+    async function refreshInlineSceneImages(messageKey, box, record, currentSrc = '', markdown = null) {
+        const selector = `.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"]`;
+        const target = markdown || (box?.isConnected ? box : document.querySelector(selector))?.parentElement;
+        if (!target?.isConnected) return;
+        const roomId = getRoomId();
+        const refresh = {};
+        target.__cspImageRefresh = refresh;
+        const history = normalizeSceneRecordHistory(record, messageKey)?.history || [];
+        const currentIndex = clampHistoryIndex(record);
+        const placements = await getInlineScenePlacements({ ...record, history });
+        if (!target.isConnected || target.__cspImageRefresh !== refresh || getRoomId() !== roomId || getMessageKey(target) !== messageKey) return;
+
+        const blocks = getInsertableContentBlocks(target);
+        const maxIndex = Math.max(0, blocks.length - 1);
+        const previous = Array.from(target.querySelectorAll(selector));
+        const availableCards = previous.flatMap(group => Array.from(group.children));
+        const groups = new Map();
+        const cards = history.map((item, index) => {
+            const paragraphIndex = Math.max(0, Math.min(Math.trunc(Number(placements[index]) || 0), maxIndex));
+            let group = groups.get(paragraphIndex);
+            if (!group) {
+                group = previous.find(el => Number(el.dataset.cspParagraphIndex) === paragraphIndex) || document.createElement('div');
+                group.className = 'csp-generated-scene-image';
+                group.dataset.cspParagraphIndex = String(paragraphIndex);
+                group.setAttribute('data-message-key', messageKey);
+                group.setAttribute('data-csp-mode', record.mode || 'gemini');
+                const paragraph = blocks[paragraphIndex];
+                if (paragraph?.parentElement === target) {
+                    if (paragraph.nextElementSibling !== group) paragraph.after(group);
+                } else if (group.parentElement !== target) target.append(group);
+                groups.set(paragraphIndex, group);
+            }
+
+            const previousIndex = availableCards.findIndex(card => matchesInlineSceneItem(card, item));
+            let card = previousIndex < 0 ? null : availableCards.splice(previousIndex, 1)[0];
+            if (!card) {
+                card = document.createElement('div');
+                card.className = 'csp-inline-scene-card';
+                const img = document.createElement('img');
+                img.decoding = 'async';
+                const caption = document.createElement('div');
+                caption.className = 'csp-generated-scene-caption';
+                caption.innerHTML = buildCaption(messageKey);
+                card.append(img, caption);
+            }
+            const oldIndex = card.dataset.cspHistoryIndex;
+            card.__cspImageItem = item;
+            card.dataset.cspHistoryIndex = String(index);
+            card.querySelector('img').alt = `장면 삽화 ${index + 1}`;
+            if (card.parentElement !== group || oldIndex !== String(index)) group.append(card);
+            return card;
+        });
+        availableCards.forEach(card => card.remove());
+        previous.forEach(group => {
+            if (!groups.has(Number(group.dataset.cspParagraphIndex))) group.remove();
+        });
+        if (groups.size) refreshImageActionState(messageKey, groups.values().next().value, record);
+
+        return Promise.all(cards.map(async (card, index) => {
+            const img = card.querySelector('img');
+            const inlineSrc = (index === currentIndex && currentSrc) || history[index].imageUrl;
+            if (inlineSrc && !inlineSrc.startsWith('blob:')) {
+                if (img.getAttribute('src') !== inlineSrc) img.src = inlineSrc;
+                card.hidden = false;
+                return;
+            }
+            if (img.hasAttribute('src') || card.__cspImagePending) return;
+            card.hidden = true;
+            const imageId = history[index].imageId;
+            if (!imageId) return;
+            card.__cspImagePending = true;
+            try {
+                const src = await getStoredImage(imageId);
+                if (!src || !card.isConnected || img.hasAttribute('src')) return;
+                img.src = src;
+                card.hidden = false;
+            } catch (err) {
+                debugLog('Failed to restore inline image', imageId, err);
+            } finally {
+                card.__cspImagePending = false;
+            }
+        }));
     }
 
-    // 히스토리 이동/삭제 뒤 공통: 현재 항목 반영 → 저장 → 이미지 교체 → 컨트롤 갱신.
-    async function applyCurrentSceneHistory(messageKey, records, record, box = null) {
+    // Keep the active prompt archive in sync after deleting an image.
+    async function applyCurrentSceneHistory(messageKey, records, record, box, roomId) {
         syncCurrentImageFieldsFromHistory(record);
         await cspComicHydrateSelectedRecord(record);
         records[messageKey] = record;
-        saveSceneRecords(records);
-
-        const src = await getRecordImageSrc(record);
-        const targetBox = box || document.querySelector(`.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"]`);
-        const img = targetBox?.querySelector('img');
-        if (img && src) img.src = src;
-        refreshImageHistoryControls(messageKey, targetBox, record);
-    }
-
-    async function setCurrentSceneHistoryIndex(messageKey, index, box = null) {
-        const records = getSceneRecords();
-        const record = normalizeSceneRecordHistory(records[messageKey], messageKey);
-        if (!record || !Array.isArray(record.history) || !record.history.length) return false;
-
-        record.currentIndex = Math.max(0, Math.min(Number(index) || 0, record.history.length - 1));
-        await applyCurrentSceneHistory(messageKey, records, record, box);
-        return true;
+        saveSceneRecords(records, { roomId });
+        if (roomId === getRoomId()) await refreshInlineSceneImages(messageKey, box, record);
     }
 
     // v5.3.0: 인라인 🗑️(현재 이미지)·갤러리·스튜디오 필름(지정 index) 삭제 공용 구현.
     // index가 null이면 현재 이미지를 지운다. box를 주면 그 박스 기준으로 DOM을 정리한다.
     async function deleteSceneHistoryImage(messageKey, index = null, box = null) {
-        const records = getSceneRecords();
+        const roomId = getRoomId();
+        const records = getSceneRecords(roomId);
         const record = normalizeSceneRecordHistory(records[messageKey], messageKey);
         if (!record || !Array.isArray(record.history) || !record.history.length) {
             await clearSceneRecordForMessage(messageKey, { box });
@@ -3493,7 +3532,7 @@ director.lightingIntent:
                 console.warn('[Crack Scene Painter] history image delete failed:', err);
             }
         }
-        if (removed?.promptArchiveId) {
+        if (removed?.promptArchiveId && !record.history.some(item => item.promptArchiveId === removed.promptArchiveId)) {
             await deletePromptArchiveById(removed.promptArchiveId);
             // 지운 보관본 id가 record에 남아 있으면 남은 예전 항목이 그 id를 물려받는다.
             if (record.promptArchiveId === removed.promptArchiveId) delete record.promptArchiveId;
@@ -3502,18 +3541,14 @@ director.lightingIntent:
         if (!record.history.length) {
             await deleteRecordPromptArchives(record);
             delete records[messageKey];
-            saveSceneRecords(records);
-            if (box) {
-                const row = box.nextElementSibling?.classList?.contains('csp-image-history-row')
-                    ? box.nextElementSibling
-                    : document.querySelector(`.csp-image-history-row[data-message-key="${CSS.escape(messageKey)}"]`);
-                row?.remove();
-                box.remove();
-            } else {
-                document
-                    .querySelectorAll(`.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"], .csp-image-history-row[data-message-key="${CSS.escape(messageKey)}"]`)
-                    .forEach(el => el.remove());
-            }
+            saveSceneRecords(records, { roomId });
+            if (roomId !== getRoomId()) return { removedAll: true, remaining: 0 };
+            const scope = box?.parentElement || document;
+            scope.querySelectorAll(`.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"], .csp-image-history-row[data-message-key="${CSS.escape(messageKey)}"]`)
+                .forEach(el => {
+                    if (el.parentElement) el.parentElement.__cspImageRefresh = null;
+                    el.remove();
+                });
             markSceneButtons(messageKey, false);
             return { removedAll: true, remaining: 0 };
         }
@@ -3521,8 +3556,8 @@ director.lightingIntent:
         if (deleteIndex < previousCurrent) record.currentIndex = previousCurrent - 1;
         else if (deleteIndex === previousCurrent) record.currentIndex = Math.min(deleteIndex, record.history.length - 1);
         else record.currentIndex = previousCurrent;
-        await applyCurrentSceneHistory(messageKey, records, record, box);
-        markSceneButtons(messageKey, true);
+        await applyCurrentSceneHistory(messageKey, records, record, box, roomId);
+        if (roomId === getRoomId()) markSceneButtons(messageKey, true);
 
         return { removedAll: false, remaining: record.history.length, currentIndex: clampHistoryIndex(record) };
     }
@@ -5703,7 +5738,15 @@ director.lightingIntent:
             .csp-generated-scene-image + blockquote {
                 margin-top: 14px !important;
             }
-            .csp-generated-scene-image img {
+            .csp-inline-scene-card {
+                position: relative;
+                isolation: isolate;
+                overflow: hidden;
+                border-radius: 14px;
+            }
+            .csp-inline-scene-card + .csp-inline-scene-card { margin-top: 8px; }
+            .csp-inline-scene-card[hidden] { display: none !important; }
+            .csp-inline-scene-card > img {
                 display: block;
                 width: 100%;
                 height: auto;
@@ -5979,8 +6022,8 @@ director.lightingIntent:
                 right: 14px;
                 bottom: 14px;
             }
-            .csp-generated-scene-image:hover .csp-image-info-row,
-            .csp-generated-scene-image:hover .csp-image-action-row,
+            .csp-inline-scene-card:hover .csp-image-info-row,
+            .csp-inline-scene-card:hover .csp-image-action-row,
             .csp-image-info-row:focus-within,
             .csp-image-action-row:focus-within {
                 opacity: 1;
@@ -7165,6 +7208,7 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
 
     function removeSceneImage(markdown) {
         if (!markdown) return;
+        markdown.__cspImageRefresh = null;
         markdown.querySelectorAll('.csp-generated-scene-image, .csp-image-history-row').forEach(el => el.remove());
     }
 
@@ -7273,22 +7317,17 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
         });
     }
 
-    async function showImageInfoModal(messageKey) {
-        const rec = normalizeSceneRecordHistory(getSceneRecords()[messageKey], messageKey);
-        if (!rec) return;
-        const idx = clampHistoryIndex(rec);
+    async function showImageInfoModal(messageKey, idx) {
+        const roomId = getRoomId();
+        const rec = normalizeSceneRecordHistory(getSceneRecords(roomId)[messageKey], messageKey);
+        if (!rec?.history?.[idx]) return;
         const src = await getRecordImageSrc(rec, idx);
+        if (!src || roomId !== getRoomId()) return;
         return openV35Viewer({
             src,
             title: rec?.plan?.sceneTitle || 'Scene image',
             item: { messageKey, record: rec, index: idx, model: rec?.naiSettings?.model || '' }
         });
-    }
-    async function showImageRerollSettingsModal(messageKey) {
-        if (await cspComicOpenRecord(messageKey)) return;
-        const rec = normalizeSceneRecordHistory(getSceneRecords()[messageKey], messageKey);
-        if (!rec) return;
-        return openV35StudioFromRecord(messageKey, clampHistoryIndex(rec));
     }
     function buildCaption(messageKey) {
         if (!messageKey) return '';
@@ -7308,54 +7347,6 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
                 </div>
             </div>
         `;
-    }
-
-    function insertSceneImageIntoMarkdown(markdown, imageUrl, paragraphIndex, options = {}) {
-        if (!markdown) return { ok: false, reason: 'markdown-not-found' };
-
-        // 이전 삽화/기록 행을 먼저 지운 뒤 문단을 세야 getParagraphs()가 준 번호와 같은 기준이 된다.
-        removeSceneImage(markdown);
-        const blocks = getInsertableContentBlocks(markdown);
-
-        let index = 0;
-        let target = null;
-
-        if (blocks.length) {
-            index = Math.max(0, Math.min(Number(paragraphIndex) || 0, blocks.length - 1));
-            target = blocks[index];
-        }
-
-        const box = document.createElement('div');
-        box.className = 'csp-generated-scene-image';
-        box.setAttribute('data-csp-mode', options.mode || 'gemini');
-        if (options.messageKey) box.setAttribute('data-message-key', options.messageKey);
-
-        const img = document.createElement('img');
-        img.src = imageUrl;
-        img.alt = options.alt || 'Scene Painter Image';
-
-        const caption = document.createElement('div');
-        caption.className = 'csp-generated-scene-caption';
-        if (options.captionHtml) caption.innerHTML = options.captionHtml;
-        else caption.textContent = options.caption || `Scene Painter 삽입 · AI 답변 문단 ${index + 1} 뒤`;
-
-        const historyRow = document.createElement('div');
-        historyRow.className = 'csp-image-history-row';
-        if (options.messageKey) historyRow.setAttribute('data-message-key', options.messageKey);
-        if (options.historyHtml) historyRow.innerHTML = options.historyHtml;
-
-        box.appendChild(img);
-        box.appendChild(caption);
-
-        if (target && target.parentElement === markdown) {
-            target.insertAdjacentElement('afterend', box);
-            box.insertAdjacentElement('afterend', historyRow);
-            return { ok: true, index, target, box, historyRow };
-        }
-
-        markdown.appendChild(box);
-        markdown.appendChild(historyRow);
-        return { ok: true, index: Number(paragraphIndex) || 0, target: markdown, box, historyRow, fallback: true };
     }
 
     function getRoomGalleryStats() {
@@ -7752,7 +7743,7 @@ ${JSON.stringify(bundle.worldProfile, null, 2)}`);
 ${JSON.stringify(speakers)}`;
     }
 
-    function buildGeminiUserPrompt({ markdown, room, visualBundle = null }) {
+    function buildGeminiUserPrompt({ markdown, room, visualBundle = null, batchInstruction = '' }) {
         const paragraphs = getParagraphs(markdown);
         const characterLines = buildCharacterSlotSummaryText(room);
         const pcLines = buildPcSlotSummaryText(room);
@@ -7761,7 +7752,7 @@ ${JSON.stringify(speakers)}`;
 
         return `작업 종류: 최초 자동 장면 선택
 
-아래 자료를 읽고, 사용자가 누른 AI 답변 안에서 삽화로 만들 순간 1개를 직접 골라 ScenePlan v3 JSON을 만들어라.
+${batchInstruction || '아래 자료를 읽고, 사용자가 누른 AI 답변 안에서 삽화로 만들 순간 1개를 직접 골라 ScenePlan v3 JSON을 만들어라.'}
 
 [현재 채팅방 Character Prompt 슬롯]
 ${characterLines || '(저장된 Character Prompt 슬롯 없음)'}
@@ -7806,7 +7797,9 @@ ${JSON.stringify(paragraphs, null, 2)}
 - JSON 밖의 설명이 없는가?
 
 [출력]
-${getScenePlanV2OutputContract(null)}`;
+${batchInstruction
+    ? getScenePlanV2OutputContract(null).replace('반드시 ScenePlan v3 JSON 객체 하나만 출력한다.', 'scenes 배열의 각 요소는 아래 ScenePlan v3 객체다.')
+    : getScenePlanV2OutputContract(null)}`;
     }
 
     function getParagraphOptionLabel(item) {
@@ -8076,7 +8069,7 @@ ${getScenePlanV2OutputContract(null)}`;
     }
 
     function normalizeGeminiScenePlan(rawPlan, room, markdown, forcedIndex = null, fallbackGlobalContext = null, visualBundle = null) {
-        const paragraphCount = getParagraphs(markdown).length;
+        const paragraphCount = getInsertableContentBlocks(markdown).length || getParagraphs(markdown).length;
         const idx = clampNumber(forcedIndex === null || forcedIndex === undefined ? rawPlan.insertAfterParagraph : forcedIndex, 0, Math.max(0, paragraphCount - 1), 0);
 
         const global = getGlobalSettings();
@@ -9658,17 +9651,20 @@ ${JSON.stringify(safePlan, null, 2)}
     async function insertFinalSceneImage({ markdown, imageUrl, plan, mode, basePrompt, baseNegative, finalPrompt, finalNegative, charPrompts, referenceInfo, naiSettings, workTarget = captureCspWorkTarget(markdown) }) {
         const roomId = workTarget.roomId;
         const messageKey = workTarget.messageKey;
-        const canInsert = isCurrentCspWorkTarget(workTarget);
-        const result = canInsert ? insertSceneImageIntoMarkdown(markdown, imageUrl, plan.insertAfterParagraph, {
-            mode,
-            messageKey,
-            captionHtml: buildCaption(messageKey)
-        }) : { ok: true, index: Math.max(0, Number(plan.insertAfterParagraph) || 0), box: null };
+        const existing = getSceneRecords(roomId)[messageKey];
+        if (existing) {
+            await commitGeneratedImageReroll({
+                messageKey, record: existing, imageUrl, plan, mode, roomId, settings: naiSettings,
+                promptState: { basePrompt, baseNegative, finalPrompt, finalNegative, charPrompts, ...(referenceInfo !== undefined ? { referenceInfo } : {}) }
+            });
+            if (isCurrentCspWorkTarget(workTarget)) await reapplySavedScene(markdown, null, null, messageKey);
+            return;
+        }
 
-        if (!result.ok) throw new Error('AI 답변의 문단을 찾지 못했어요.');
-
+        const blocks = isCurrentCspWorkTarget(workTarget) ? getInsertableContentBlocks(markdown) : [];
+        const paragraphIndex = Math.max(0, Math.trunc(Number(plan.insertAfterParagraph) || 0));
         const record = {
-            paragraphIndex: result.index,
+            paragraphIndex: blocks.length ? Math.min(paragraphIndex, blocks.length - 1) : paragraphIndex,
             mode,
             plan,
             basePrompt: basePrompt || '',
@@ -9694,7 +9690,16 @@ ${JSON.stringify(safePlan, null, 2)}
         }
 
         const nextRecords = getSceneRecords(roomId);
-        const replacedRecord = nextRecords[messageKey];
+        const concurrent = normalizeSceneRecordHistory(nextRecords[messageKey], messageKey);
+        if (concurrent) {
+            if (isSceneHistoryFull(concurrent)) {
+                if (currentHistoryItem.imageId) await deleteStoredImage(currentHistoryItem.imageId);
+                throw new Error(`이 장면에 삽화가 이미 ${CSP_MAX_IMAGE_HISTORY}장 있어요.`);
+            }
+            record.paragraphIndex = concurrent.paragraphIndex;
+            record.history = [...concurrent.history, currentHistoryItem];
+            record.currentIndex = record.history.length - 1;
+        }
         nextRecords[messageKey] = record;
         saveSceneRecords(nextRecords, { roomId });
         if (plan?.outputKind === 'comic') {
@@ -9705,16 +9710,15 @@ ${JSON.stringify(safePlan, null, 2)}
                 label: `만화 생성 ${new Date(currentHistoryItem?.createdAt || Date.now()).toLocaleString()}`
             }).catch(err => console.warn('[Crack Scene Painter] comic mixer source archive failed:', err));
         }
-        // 이 메시지에 이미 기록이 있었으면 새 기록으로 교체되므로, 원래 방 기준으로 이전 기록의 이미지·프롬프트를 정리한다.
-        if (replacedRecord && replacedRecord !== record) cleanupPrunedSceneRecords({ [messageKey]: replacedRecord }, {}, roomId);
-        if (!isCurrentCspWorkTarget(workTarget) || !result.box?.isConnected) {
+        if (!isCurrentCspWorkTarget(workTarget)) {
             showToast('🖼️ 생성한 삽화를 원래 방의 갤러리에 저장했어요.');
             return;
         }
         try { if (plan?.outputKind !== 'comic') commitCurrentSceneStateFromPlan(plan); } catch (stateErr) { console.warn('[Crack Scene Painter] Visual Context state commit skipped:', stateErr); }
-        refreshImageHistoryControls(messageKey, result.box, record);
+        await refreshInlineSceneImages(messageKey, null, record, imageUrl, markdown);
+        if (!isCurrentCspWorkTarget(workTarget)) return;
         markSceneButtons(messageKey, true);
-        showToast(`🖼️ 문단 ${result.index + 1} 뒤에 삽입 완료`);
+        showToast(`🖼️ 문단 ${record.paragraphIndex + 1} 뒤에 삽입 완료`);
     }
 
     let cspOpenImageMenu = null;
@@ -9779,10 +9783,8 @@ ${JSON.stringify(safePlan, null, 2)}
         const deleteBtn = target.closest('.csp-image-delete-btn');
         const folderSaveBtn = target.closest('.csp-image-folder-save-btn');
         const rerollBtn = target.closest('.csp-image-reroll-btn');
-        const historyPrevBtn = target.closest('.csp-image-history-prev');
-        const historyNextBtn = target.closest('.csp-image-history-next');
-        const clickedImage = target.closest('.csp-generated-scene-image img');
-        const actionBtn = infoBtn || editBtn || downloadBtn || deleteBtn || folderSaveBtn || rerollBtn || historyPrevBtn || historyNextBtn;
+        const clickedImage = target.closest('.csp-inline-scene-card > img');
+        const actionBtn = infoBtn || editBtn || downloadBtn || deleteBtn || folderSaveBtn || rerollBtn;
 
         if (!actionBtn && clickedImage) {
             event.preventDefault();
@@ -9805,22 +9807,15 @@ ${JSON.stringify(safePlan, null, 2)}
         if (event.stopImmediatePropagation) event.stopImmediatePropagation();
 
         const messageKey = actionBtn.getAttribute('data-message-key') || '';
-        const records = getSceneRecords();
-        const record = records[messageKey];
+        const record = normalizeSceneRecordHistory(getSceneRecords()[messageKey], messageKey);
         const box = actionBtn.closest('.csp-generated-scene-image');
-        const img = box?.querySelector('img');
-
-        if (historyPrevBtn || historyNextBtn) {
-            if (!record) return;
-            normalizeSceneRecordHistory(record, messageKey);
-            const delta = historyPrevBtn ? -1 : 1;
-            const nextIndex = clampHistoryIndex(record) + delta;
-            await setCurrentSceneHistoryIndex(messageKey, nextIndex, box);
-            return;
-        }
+        const card = actionBtn.closest('.csp-inline-scene-card');
+        const index = Number(card?.dataset.cspHistoryIndex);
+        if (!Number.isInteger(index) || !matchesInlineSceneItem(card, record?.history?.[index])) return;
+        const img = card.querySelector('img');
 
         if (infoBtn) {
-            showImageInfoModal(messageKey);
+            await showImageInfoModal(messageKey, index);
             return;
         }
 
@@ -9830,13 +9825,12 @@ ${JSON.stringify(safePlan, null, 2)}
                 showToast(`⚠️ 리롤 기록은 최대 ${CSP_MAX_IMAGE_HISTORY}장이에요. 휴지통으로 이미지를 지우면 리롤 설정을 다시 열 수 있어요.`);
                 return;
             }
-            showImageRerollSettingsModal(messageKey, box, img);
+            await openV35StudioFromRecord(messageKey, index);
             return;
         }
 
         if (downloadBtn) {
-            let src = img?.src || '';
-            if (!src && record) src = await getRecordImageSrc(record);
+            const src = img.getAttribute('src') || await getRecordImageSrc(record, index);
             if (!src) {
                 showToast('⚠️ 다운로드할 이미지가 없어요.');
                 return;
@@ -9852,8 +9846,7 @@ ${JSON.stringify(safePlan, null, 2)}
         }
 
         if (folderSaveBtn) {
-            let src = img?.src || '';
-            if (!src && record) src = await getRecordImageSrc(record);
+            const src = img.getAttribute('src') || await getRecordImageSrc(record, index);
             if (!src) {
                 showToast('⚠️ 폴더에 저장할 이미지가 없어요.');
                 return;
@@ -9869,14 +9862,14 @@ ${JSON.stringify(safePlan, null, 2)}
         }
 
         if (deleteBtn) {
-            const result = await deleteSceneHistoryImage(messageKey, null, box);
+            const result = await deleteSceneHistoryImage(messageKey, index, box);
             if (result?.removedAll) showToast('🗑️ 삽화를 삭제했어요. 설정은 유지했어요.');
             else showToast(`🗑️ 현재 이미지를 삭제했어요. 남은 이미지 ${result.remaining}장`);
             return;
         }
 
         if (rerollBtn) {
-            await runCspQuickReroll({messageKey,button:rerollBtn,box,img});
+            await runCspQuickReroll({messageKey,index,button:rerollBtn,box});
         }
     }
 
@@ -10137,6 +10130,7 @@ ${JSON.stringify(safePlan, null, 2)}
             promptArchiveId: record.promptArchiveId || '',
             currentIndex: record.currentIndex ?? '',
             history: history.map(item => ({
+                paragraphIndex: item?.paragraphIndex,
                 imageId: item?.imageId || '',
                 imageUrl: item?.imageUrl || '',
                 promptArchiveId: item?.promptArchiveId || '',
@@ -10221,19 +10215,16 @@ ${JSON.stringify(safePlan, null, 2)}
         if (getSceneRecordRestoreSignature(record) !== beforeSignature) dirty = true;
 
         const normalizedSignature = getSceneRecordRestoreSignature(record);
-        let imageUrl = await getRecordImageSrc(record);
+        let imageUrl = await getRecordImageSrc(record).catch(err => {
+            debugLog('Failed to restore the active image', key, err);
+            return '';
+        });
         if (!targetValid()) return;
         if (getSceneRecordRestoreSignature(record) !== normalizedSignature || (!recordOverride && getSceneRecords()[key] !== record)) {
             if (getSceneRecords()[key]) enqueueSceneRestore(markdown, key);
             return;
         }
-        if (String(imageUrl || '').startsWith('blob:')) {
-            delete records[key];
-            saveSceneRecords(records, { skipPromptArchiveWrite: true, roomId });
-            return;
-        }
-
-        if (!imageUrl) return;
+        if (String(imageUrl || '').startsWith('blob:')) imageUrl = '';
 
         // 예전 data URL 기록이 남아 있으면 IndexedDB로 옮기고 localStorage에서는 제거합니다.
         const currentItem = getCurrentHistoryItem(record);
@@ -10256,13 +10247,9 @@ ${JSON.stringify(safePlan, null, 2)}
             saveSceneRecords(records, { skipPromptArchiveWrite: true, roomId });
         }
 
-        insertSceneImageIntoMarkdown(markdown, imageUrl, record.paragraphIndex, {
-            mode: record.mode || 'gemini',
-            messageKey: key,
-            captionHtml: buildCaption(key),
-            historyHtml: buildImageHistoryControls(key, record)
-        });
-        markSceneButtons(key, true);
+        if (!targetValid() || markdown.querySelector('.csp-generated-scene-image')) return;
+        await refreshInlineSceneImages(key, null, record, imageUrl, markdown);
+        if (targetValid() && markdown.querySelector('.csp-generated-scene-image')) markSceneButtons(key, true);
     }
 
     function makeMessageGenerateButton(markdown, existingRecord = null, knownKey = '') {
@@ -11048,7 +11035,7 @@ ${JSON.stringify(safePlan, null, 2)}
     }
 
     function closeV35(){cspV35Root?.__v35ViewportCleanup?.();cspV35Root?.querySelector('.v35-menu')?.__v35Cleanup?.();stopV35ThemeSync();try{cspV35CanvasObserver?.disconnect()}catch(_){}cspV35CanvasObserver=null;cspV35RefineDialog?.close?.(null);cspV35RefineDialog=null;try{cspV35Root?.__v35ThumbObserver?.disconnect()}catch(_){}releaseGalleryThumbUrls();cspV35ImageSrcCache.clear();cspV35Root?.remove();cspV35Root=null;cspV35Viewer=null;document.documentElement.style.overflow=''}
-    function exitV35Studio(){closeV35();cspV35Session=null}
+    function exitV35Studio(){cspV35Session?.batchController?.abort();closeV35();cspV35Session=null}
     function mountV35(kind=''){ensureV35Styles();closeV35();const root=document.createElement('div');root.id='csp-v35-root';root.className=v35ThemeClass();const app=document.createElement('div');app.className=`v35-app ${kind}`.trim();root.appendChild(app);document.body.appendChild(root);document.documentElement.style.overflow='hidden';cspV35Root=root;bindV35Viewport(root);applyV35Theme(root);startV35ThemeSync();root.addEventListener('mousedown',e=>{if(e.target===root)closeV35()});return{root,app}}
 
     // ── 할당량 · 예산 표시용 헬퍼 (표시 전용, 생성 로직과 무관) ──
@@ -11503,7 +11490,7 @@ ${v35GaugeHtml({thin:true,percent:b.charCount/b.maxCharacters*100,tone:'ok'})}</
         if(prev&&prev!==slot&&prev.__v35Src===s.currentImageSrc){slot.replaceWith(prev);return}
         slot.__v35Src=s.currentImageSrc;slot.src=s.currentImageSrc;
     }
-    function renderV35Studio(){if(!cspV35Session)return;const s=cspV35Session,reused=reuseV35StudioRoot(s),keepFocus=reused?captureV35Focus(reused.app):null,scrollTop=reused?.app.querySelector('.studio')?.scrollTop,quickOffset=reused?.app.querySelector('.studio-quick')?.scrollLeft,prevImg=reused?reused.app.querySelector('#v35-main-img'):null,{root,app}=reused||mountV35();root.__v35Session=s;root.dataset.view='studio';const model=v35Model(),fam=getNaiModelCapability(model).family,uc=normalizeNaiUcPresetForModel(s.generation.ucPreset,model),subOpen=isV35SubtitleOpen(s);app.innerHTML=`<div class="v35-top"><div class="v35-brand">🎨 Scene Painter <small>스튜디오</small></div><div class="studio-quick"><select class="select" id="v35-q-model" style="width:175px">${buildNaiModelOptionsHtml(model)}</select><select class="select" id="v35-q-size" style="width:145px"><option value="portrait" ${s.generation.width==832&&s.generation.height==1216?'selected':''}>832 × 1216</option><option value="square" ${s.generation.width==1024&&s.generation.height==1024?'selected':''}>1024 × 1024</option><option value="landscape" ${s.generation.width==1216&&s.generation.height==832?'selected':''}>1216 × 832</option><option value="custom">직접 입력</option></select>${fam==='v5'?`<select class="select" id="v35-q-quality" style="width:130px"><option value="none" ${s.generation.v5QualityPreset==='none'?'selected':''}>품질 · 없음</option><option value="light" ${s.generation.v5QualityPreset==='light'?'selected':''}>품질 · 라이트</option><option value="standard" ${s.generation.v5QualityPreset==='standard'?'selected':''}>품질 · 표준</option></select>`:`<button class="btn" id="v35-q-quality-toggle">품질 태그 · ${s.generation.qualityToggle!==false?'켜짐':'꺼짐'}</button>`}<select class="select" id="v35-q-uc" style="width:160px">${buildNaiUcPresetOptionsHtml(uc,model)}</select><div class="grow"></div>${v35QuotaChipHtml()}${v35BudgetChipHtml()}${v35CostChipHtml()}</div><button class="btn ghost" id="v35-gallery-open">🖼 갤러리</button><button class="btn ghost" id="v35-settings-open">⚙ 설정</button><button class="iconbtn" id="v35-close">×</button></div><div class="studio ${s.tool?'panel':''}"><div class="rail"><button class="iconbtn ${s.tool==='scene'?'active':''}" data-tool="scene" title="장면">🎬</button><button class="iconbtn ${s.tool==='characters'?'active':''}" data-tool="characters" title="캐릭터">👥</button><button class="iconbtn ${s.tool==='context'?'active':''}" data-tool="context" title="장면 정보">🌐</button><div class="grow"></div><button class="iconbtn ${s.tool==='raw'?'active':''}" data-tool="raw" title="원문 / 디버그">⌘</button></div>${s.tool?'<aside class="context-panel" id="v35-tool-panel"></aside>':''}<main class="output"><div class="canvas-wrap"><div class="canvas" id="v35-canvas" style="--iw:${Number(s.generation.width)||832};--ih:${Number(s.generation.height)||1216}">${s.currentImageSrc?`<img id="v35-main-img">${subOpen?'<canvas id="v35-sub-canvas" class="sub-canvas" title="클릭해서 대사 입력"></canvas>':''}<div class="canvas-tools"><button class="iconbtn glass" id="v35-view">⛶</button><button class="iconbtn glass" id="v35-download">↓</button><button type="button" class="iconbtn glass" id="v35-delete-image" title="선택한 이미지 삭제" aria-label="선택한 이미지 삭제" ${s.currentHistoryIndex == null || !['idle','ready'].includes(s.status) ? 'disabled' : ''}>🗑</button></div>`:`<div class="canvas-empty"><strong>생성 준비 완료</strong>장면 분석이 끝났어.<br>프롬프트를 확인하고 생성해줘.</div>`}${s.positionMode?v35PositionOverlayHtml(s):''}${!['idle','ready'].includes(s.status)&&!s.error?`<div class="loading"><div class="loading-card"><div class="spinner"></div><strong>${escapeHtml(s.statusMessage||'처리 중…')}</strong></div></div>`:''}</div>${s.error?`<div style="position:absolute;left:24px;right:24px;bottom:24px;padding:12px;border:1px solid var(--danger);border-radius:12px;background:var(--sf);color:var(--danger)">${escapeHtml(s.error)}</div>`:''}</div>${subOpen?v35SubtitleDockHtml(s):`<div class="film"><div class="film-label">🎞 장면</div><div id="v35-film" style="display:flex;gap:6px;align-items:center"></div><div class="grow"></div><button class="btn ghost tiny" id="v35-film-all">전체 기록 보기 →</button></div>`}</main><aside class="inspector"><div class="inspector-tabs"><button class="tab ${s.inspector==='prompt'?'active':''}" data-inspector="prompt">✍ 프롬프트</button><button class="tab ${s.inspector==='generate'?'active':''}" data-inspector="generate">⚙ 생성</button></div><div class="inspector-body" id="v35-inspector"></div></aside></div><div class="bottom"><button class="btn" id="v35-comic-mode"><svg class="csp-comic-icon" style="display:inline-block;width:16px;height:16px;flex:0 0 16px;vertical-align:-3px;color:inherit" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="4" width="18" height="16" rx="1.3"/><path d="M7.5 7.5h5a1.5 1.5 0 0 1 1.5 1.5v2a1.5 1.5 0 0 1-1.5 1.5h-2L8 14v-1.5h-.5A1.5 1.5 0 0 1 6 11V9a1.5 1.5 0 0 1 1.5-1.5Z"/><path d="m15 17 3-3m0 3h1"/></svg> 만화</button><button class="btn" id="v35-reanalyze" ${s.markdown?'':'disabled title="원래 메시지가 현재 DOM에 없어서 재분석할 수 없어."'}>↻ 요청 재분석</button><button class="btn ${subOpen?'is-on':''}" id="v35-subtitle" ${s.currentImageSrc?'':'disabled'} title="이미지 하단에 영화 자막 넣기">💬 텍스트 편집</button><span class="help" id="v35-dirty">${s.promptDirty||s.negativeDirty||s.characterDirty?'● 프롬프트 수정됨':''}</span><div class="nai-usage" id="v35-nai-usage" title="클릭해서 NAI 할당량/Anlas 새로고침"><span class="nai-usage-label">${fam==='v5'?'V5 할당량':'NAI'}</span>${fam==='v5'?'<span class="nai-usage-track"><i class="nai-usage-fill"></i></span>':''}<b class="nai-usage-pct">…</b><span class="nai-usage-anlas">Anlas …</span></div><div class="grow"></div><button class="btn" id="v35-reroll" ${s.currentImageSrc?'':'disabled'}>🎲 같은 설정으로 리롤${v35CostSuffixHtml()}</button><button class="btn ${v35GenerateToneClass()}" id="v35-generate">${v35GenerateLabelHtml()}</button></div>`;placeV35MainImage(root,s,prevImg);bindV35Studio(root);renderV35ToolPanel(root);renderV35Inspector(root);renderV35Film(root);bindV35CanvasFit(root);bindV35Subtitle(root);restoreV35Focus(app,keepFocus);if(scrollTop)app.querySelector('.studio').scrollTop=scrollTop;if(quickOffset)app.querySelector('.studio-quick').scrollLeft=quickOffset;refreshV35NaiUsage(root);hydrateV35CurrentImageFromHistory(s)}
+    function renderV35Studio(){if(!cspV35Session)return;const s=cspV35Session,reused=reuseV35StudioRoot(s),keepFocus=reused?captureV35Focus(reused.app):null,scrollTop=reused?.app.querySelector('.studio')?.scrollTop,quickOffset=reused?.app.querySelector('.studio-quick')?.scrollLeft,prevImg=reused?reused.app.querySelector('#v35-main-img'):null,{root,app}=reused||mountV35();root.__v35Session=s;root.dataset.view='studio';const model=v35Model(),fam=getNaiModelCapability(model).family,uc=normalizeNaiUcPresetForModel(s.generation.ucPreset,model),subOpen=isV35SubtitleOpen(s);app.innerHTML=`<div class="v35-top"><div class="v35-brand">🎨 Scene Painter <small>스튜디오</small></div><div class="studio-quick"><select class="select" id="v35-q-model" style="width:175px">${buildNaiModelOptionsHtml(model)}</select><select class="select" id="v35-q-size" style="width:145px"><option value="portrait" ${s.generation.width==832&&s.generation.height==1216?'selected':''}>832 × 1216</option><option value="square" ${s.generation.width==1024&&s.generation.height==1024?'selected':''}>1024 × 1024</option><option value="landscape" ${s.generation.width==1216&&s.generation.height==832?'selected':''}>1216 × 832</option><option value="custom">직접 입력</option></select>${fam==='v5'?`<select class="select" id="v35-q-quality" style="width:130px"><option value="none" ${s.generation.v5QualityPreset==='none'?'selected':''}>품질 · 없음</option><option value="light" ${s.generation.v5QualityPreset==='light'?'selected':''}>품질 · 라이트</option><option value="standard" ${s.generation.v5QualityPreset==='standard'?'selected':''}>품질 · 표준</option></select>`:`<button class="btn" id="v35-q-quality-toggle">품질 태그 · ${s.generation.qualityToggle!==false?'켜짐':'꺼짐'}</button>`}<select class="select" id="v35-q-uc" style="width:160px">${buildNaiUcPresetOptionsHtml(uc,model)}</select><div class="grow"></div>${v35QuotaChipHtml()}${v35BudgetChipHtml()}${v35CostChipHtml()}</div><button class="btn ghost" id="v35-gallery-open">🖼 갤러리</button><button class="btn ghost" id="v35-settings-open">⚙ 설정</button><button class="iconbtn" id="v35-close">×</button></div><div class="studio ${s.tool?'panel':''}"><div class="rail"><button class="iconbtn ${s.tool==='scene'?'active':''}" data-tool="scene" title="장면">🎬</button><button class="iconbtn ${s.tool==='characters'?'active':''}" data-tool="characters" title="캐릭터">👥</button><button class="iconbtn ${s.tool==='context'?'active':''}" data-tool="context" title="장면 정보">🌐</button><div class="grow"></div><button class="iconbtn ${s.tool==='raw'?'active':''}" data-tool="raw" title="원문 / 디버그">⌘</button></div>${s.tool?'<aside class="context-panel" id="v35-tool-panel"></aside>':''}<main class="output"><div class="canvas-wrap"><div class="canvas" id="v35-canvas" style="--iw:${Number(s.generation.width)||832};--ih:${Number(s.generation.height)||1216}">${s.currentImageSrc?`<img id="v35-main-img">${subOpen?'<canvas id="v35-sub-canvas" class="sub-canvas" title="클릭해서 대사 입력"></canvas>':''}<div class="canvas-tools"><button class="iconbtn glass" id="v35-view">⛶</button><button class="iconbtn glass" id="v35-download">↓</button><button type="button" class="iconbtn glass" id="v35-delete-image" title="선택한 이미지 삭제" aria-label="선택한 이미지 삭제" ${s.currentHistoryIndex == null || !['idle','ready'].includes(s.status) ? 'disabled' : ''}>🗑</button></div>`:`<div class="canvas-empty"><strong>생성 준비 완료</strong>장면 분석이 끝났어.<br>프롬프트를 확인하고 생성해줘.</div>`}${s.positionMode?v35PositionOverlayHtml(s):''}${!['idle','ready'].includes(s.status)&&!s.error?`<div class="loading"><div class="loading-card"><div class="spinner"></div><strong>${escapeHtml(s.statusMessage||'처리 중…')}</strong></div></div>`:''}</div>${s.error?`<div style="position:absolute;left:24px;right:24px;bottom:24px;padding:12px;border:1px solid var(--danger);border-radius:12px;background:var(--sf);color:var(--danger)">${escapeHtml(s.error)}</div>`:''}</div>${subOpen?v35SubtitleDockHtml(s):`<div class="film"><div class="film-label">🎞 장면</div><div id="v35-film" style="display:flex;gap:6px;align-items:center"></div><div class="grow"></div><button class="btn ghost tiny" id="v35-film-all">전체 기록 보기 →</button></div>`}</main><aside class="inspector"><div class="inspector-tabs"><button class="tab ${s.inspector==='prompt'?'active':''}" data-inspector="prompt">✍ 프롬프트</button><button class="tab ${s.inspector==='generate'?'active':''}" data-inspector="generate">⚙ 생성</button></div><div class="inspector-body" id="v35-inspector"></div></aside></div><div class="bottom"><button class="btn" id="v35-comic-mode"><svg class="csp-comic-icon" style="display:inline-block;width:16px;height:16px;flex:0 0 16px;vertical-align:-3px;color:inherit" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="4" width="18" height="16" rx="1.3"/><path d="M7.5 7.5h5a1.5 1.5 0 0 1 1.5 1.5v2a1.5 1.5 0 0 1-1.5 1.5h-2L8 14v-1.5h-.5A1.5 1.5 0 0 1 6 11V9a1.5 1.5 0 0 1 1.5-1.5Z"/><path d="m15 17 3-3m0 3h1"/></svg> 만화</button><button class="btn" id="v35-reanalyze" ${s.markdown?'':'disabled title="원래 메시지가 현재 DOM에 없어서 재분석할 수 없어."'}>↻ 요청 재분석</button><button class="btn ${subOpen?'is-on':''}" id="v35-subtitle" ${s.currentImageSrc?'':'disabled'} title="이미지 하단에 영화 자막 넣기">💬 텍스트 편집</button><span class="help" id="v35-dirty">${s.promptDirty||s.negativeDirty||s.characterDirty?'● 프롬프트 수정됨':''}</span><div class="nai-usage" id="v35-nai-usage" title="클릭해서 NAI 할당량/Anlas 새로고침"><span class="nai-usage-label">${fam==='v5'?'V5 할당량':'NAI'}</span>${fam==='v5'?'<span class="nai-usage-track"><i class="nai-usage-fill"></i></span>':''}<b class="nai-usage-pct">…</b><span class="nai-usage-anlas">Anlas …</span></div><div class="grow"></div><button class="btn" id="v35-reroll" ${s.currentImageSrc?'':'disabled'}>🎲 같은 설정으로 리롤${v35CostSuffixHtml()}</button><button class="btn ${v35GenerateToneClass()}" id="v35-generate">${v35GenerateLabelHtml()}</button>${s.markdown ? '<button class="btn" id="v35-generate-batch" title="답변에서 다른 장면을 골라 최대 세 장 만들기" ' + (['idle','ready'].includes(s.status) ? '' : 'disabled') + '>여러 장 생성</button>' : ''}</div>`;placeV35MainImage(root,s,prevImg);bindV35Studio(root);renderV35ToolPanel(root);renderV35Inspector(root);renderV35Film(root);bindV35CanvasFit(root);bindV35Subtitle(root);restoreV35Focus(app,keepFocus);if(scrollTop)app.querySelector('.studio').scrollTop=scrollTop;if(quickOffset)app.querySelector('.studio-quick').scrollLeft=quickOffset;refreshV35NaiUsage(root);hydrateV35CurrentImageFromHistory(s)}
     function renderV35ToolPanel(root){
         const p=root.querySelector('#v35-tool-panel'),s=cspV35Session;
         if(!p||!s.tool)return;
@@ -11711,7 +11698,7 @@ ${v35GaugeHtml({thin:true,percent:b.charCount/b.maxCharacters*100,tone:'ok'})}</
         // 필름 칸(46px)에는 원본 data URL 대신 갤러리와 같은 작은 썸네일을 쓴다(object URL 캐시라 다시 그려도 IndexedDB를 다시 읽지 않는다).
         await Promise.all(h.map(async(x,i)=>{const b=box.querySelector(`[data-hi="${i}"]`);if(!b)return;try{const src=await getGalleryThumbUrl(x?.imageId,()=>getV35StudioImageSrc(rec,i));if(!b.isConnected)return;const im=document.createElement('img');im.src=src;b.replaceChildren(im)}catch(_){b.textContent='×'}}))
     }
-    function bindV35Studio(root){cspComicBindIllustrationShortcut(root);const s=cspV35Session;root.querySelector('#v35-close')?.addEventListener('click',exitV35Studio);root.querySelector('#v35-gallery-open')?.addEventListener('click',openV35Gallery);root.querySelector('#v35-film-all')?.addEventListener('click',openV35Gallery);root.querySelector('#v35-settings-open')?.addEventListener('click',()=>openV35Settings('connection'));root.querySelector('#v35-quota-chip')?.addEventListener('click',()=>{cspV35Session.inspector='generate';renderV35Studio()});root.querySelector('#v35-budget-chip')?.addEventListener('click',()=>{cspV35Session.inspector='prompt';renderV35Studio()});root.querySelector('#v35-cost-chip')?.addEventListener('click',()=>{cspV35Session.inspector='generate';renderV35Studio()});root.querySelectorAll('[data-tool]').forEach(btn=>btn.addEventListener('click',()=>{const t=btn.dataset.tool;s.tool=s.tool===t?'':t;patchV35Ui('studio',{tool:s.tool});renderV35Studio()}));root.querySelectorAll('[data-inspector]').forEach(btn=>btn.addEventListener('click',()=>{s.inspector=btn.dataset.inspector;patchV35Ui('studio',{inspector:s.inspector});renderV35Studio()}));root.querySelector('#v35-q-model')?.addEventListener('change',e=>{const old=v35Model();Object.assign(s.generation,setNaiUcPresetForModel(s.generation,old,s.generation.ucPreset));s.generation.model=normalizeNaiModel(e.target.value);s.generation.ucPreset=getNaiUcPresetForModel(s.generation,s.generation.model);renderV35Studio()});root.querySelector('#v35-q-size')?.addEventListener('change',e=>{const map={portrait:[832,1216],square:[1024,1024],landscape:[1216,832]},v=map[e.target.value];if(v){s.generation.width=v[0];s.generation.height=v[1];renderV35Studio()}else{s.inspector='generate';renderV35Studio()}});root.querySelector('#v35-q-quality')?.addEventListener('change',e=>{s.generation.v5QualityPreset=normalizeNaiV5QualityPreset(e.target.value);const gq=root.querySelector('#v35-g-quality');if(gq)gq.value=s.generation.v5QualityPreset});root.querySelector('#v35-q-quality-toggle')?.addEventListener('click',()=>{s.generation.qualityToggle=!s.generation.qualityToggle;renderV35Studio()});root.querySelector('#v35-q-uc')?.addEventListener('change',e=>{Object.assign(s.generation,setNaiUcPresetForModel(s.generation,v35Model(),e.target.value));s.generation.ucPreset=getNaiUcPresetForModel(s.generation,v35Model());const gu=root.querySelector('#v35-g-uc');if(gu)gu.value=String(s.generation.ucPreset)});root.querySelector('#v35-generate')?.addEventListener('click',()=>runV35Generation(false));root.querySelector('#v35-reroll')?.addEventListener('click',()=>runV35Generation(true));root.querySelector('#v35-reanalyze')?.addEventListener('click',()=>runV35Reanalysis());root.querySelector('#v35-subtitle')?.addEventListener('click',()=>toggleV35Subtitle());root.querySelector('#v35-view')?.addEventListener('click',()=>openV35Viewer({src:s.currentImageSrc,title:s.plan.sceneTitle||'Scene image'}));root.querySelector('#v35-download')?.addEventListener('click',()=>v35다운로드(s.currentImageSrc,s.plan.sceneTitle||'scene-image'));root.querySelector('#v35-delete-image')?.addEventListener('click',()=>deleteV35StudioImage(s,s.currentHistoryIndex));root.querySelector('#v35-nai-usage')?.addEventListener('click',v35RequestQuotaRefresh);{const mainImg=root.querySelector('#v35-main-img');/* 같은 <img>를 다음 렌더에서도 쓰므로 한 번만 붙인다. */if(mainImg&&!mainImg.__v35ErrorBound){mainImg.__v35ErrorBound=true;mainImg.addEventListener('error',()=>{const bad=s.currentImageSrc;if(s.__failedImageSrc===bad)return;s.__failedImageSrc=bad;s.currentImageSrc='';hydrateV35CurrentImageFromHistory(s,{force:true})},{once:true})}}bindV35PositionOverlay(root)}
+    function bindV35Studio(root){cspComicBindIllustrationShortcut(root);const s=cspV35Session;root.querySelector('#v35-close')?.addEventListener('click',exitV35Studio);root.querySelector('#v35-gallery-open')?.addEventListener('click',openV35Gallery);root.querySelector('#v35-film-all')?.addEventListener('click',openV35Gallery);root.querySelector('#v35-settings-open')?.addEventListener('click',()=>openV35Settings('connection'));root.querySelector('#v35-quota-chip')?.addEventListener('click',()=>{cspV35Session.inspector='generate';renderV35Studio()});root.querySelector('#v35-budget-chip')?.addEventListener('click',()=>{cspV35Session.inspector='prompt';renderV35Studio()});root.querySelector('#v35-cost-chip')?.addEventListener('click',()=>{cspV35Session.inspector='generate';renderV35Studio()});root.querySelectorAll('[data-tool]').forEach(btn=>btn.addEventListener('click',()=>{const t=btn.dataset.tool;s.tool=s.tool===t?'':t;patchV35Ui('studio',{tool:s.tool});renderV35Studio()}));root.querySelectorAll('[data-inspector]').forEach(btn=>btn.addEventListener('click',()=>{s.inspector=btn.dataset.inspector;patchV35Ui('studio',{inspector:s.inspector});renderV35Studio()}));root.querySelector('#v35-q-model')?.addEventListener('change',e=>{const old=v35Model();Object.assign(s.generation,setNaiUcPresetForModel(s.generation,old,s.generation.ucPreset));s.generation.model=normalizeNaiModel(e.target.value);s.generation.ucPreset=getNaiUcPresetForModel(s.generation,s.generation.model);renderV35Studio()});root.querySelector('#v35-q-size')?.addEventListener('change',e=>{const map={portrait:[832,1216],square:[1024,1024],landscape:[1216,832]},v=map[e.target.value];if(v){s.generation.width=v[0];s.generation.height=v[1];renderV35Studio()}else{s.inspector='generate';renderV35Studio()}});root.querySelector('#v35-q-quality')?.addEventListener('change',e=>{s.generation.v5QualityPreset=normalizeNaiV5QualityPreset(e.target.value);const gq=root.querySelector('#v35-g-quality');if(gq)gq.value=s.generation.v5QualityPreset});root.querySelector('#v35-q-quality-toggle')?.addEventListener('click',()=>{s.generation.qualityToggle=!s.generation.qualityToggle;renderV35Studio()});root.querySelector('#v35-q-uc')?.addEventListener('change',e=>{Object.assign(s.generation,setNaiUcPresetForModel(s.generation,v35Model(),e.target.value));s.generation.ucPreset=getNaiUcPresetForModel(s.generation,v35Model());const gu=root.querySelector('#v35-g-uc');if(gu)gu.value=String(s.generation.ucPreset)});root.querySelector('#v35-generate')?.addEventListener('click',()=>runV35Generation(false));root.querySelector('#v35-generate-batch')?.addEventListener('click',runV35BatchGeneration);root.querySelector('#v35-reroll')?.addEventListener('click',()=>runV35Generation(true));root.querySelector('#v35-reanalyze')?.addEventListener('click',()=>runV35Reanalysis());root.querySelector('#v35-subtitle')?.addEventListener('click',()=>toggleV35Subtitle());root.querySelector('#v35-view')?.addEventListener('click',()=>openV35Viewer({src:s.currentImageSrc,title:s.plan.sceneTitle||'Scene image'}));root.querySelector('#v35-download')?.addEventListener('click',()=>v35다운로드(s.currentImageSrc,s.plan.sceneTitle||'scene-image'));root.querySelector('#v35-delete-image')?.addEventListener('click',()=>deleteV35StudioImage(s,s.currentHistoryIndex));root.querySelector('#v35-nai-usage')?.addEventListener('click',v35RequestQuotaRefresh);{const mainImg=root.querySelector('#v35-main-img');/* 같은 <img>를 다음 렌더에서도 쓰므로 한 번만 붙인다. */if(mainImg&&!mainImg.__v35ErrorBound){mainImg.__v35ErrorBound=true;mainImg.addEventListener('error',()=>{const bad=s.currentImageSrc;if(s.__failedImageSrc===bad)return;s.__failedImageSrc=bad;s.currentImageSrc='';hydrateV35CurrentImageFromHistory(s,{force:true})},{once:true})}}bindV35PositionOverlay(root)}
     function bindV35ToolPanel(panel){panel.querySelector('[data-close-tool]')?.addEventListener('click',()=>{cspV35Session.tool='';patchV35Ui('studio',{tool:''});renderV35Studio()});panel.querySelector('#v35-scene-title')?.addEventListener('input',e=>{cspV35Session.plan.sceneTitle=e.target.value});panel.querySelector('#v35-scene-anchor')?.addEventListener('input',e=>{cspV35Session.plan.visualAnchor=e.target.value});panel.querySelector('#v35-scene-insert')?.addEventListener('input',e=>{cspV35Session.plan.insertAfterParagraph=Math.max(0,Number(e.target.value||0))});panel.querySelector('#v35-scene-paragraph')?.addEventListener('change',e=>{cspV35Session.plan.insertAfterParagraph=Math.max(0,Number(e.target.value||0));const x=panel.querySelector('#v35-scene-insert');if(x)x.value=String(cspV35Session.plan.insertAfterParagraph)})}
     function bindV35Inspector(body){const s=cspV35Session;body.querySelectorAll('[data-edit]').forEach(btn=>btn.addEventListener('click',()=>{const k=btn.dataset.edit;s.__edit=s.__edit===k?'':k;renderV35Inspector(cspV35Root)}));body.querySelectorAll('[data-edit-char]').forEach(btn=>btn.addEventListener('click',()=>{const i=Number(btn.dataset.editChar);s.__charEdit=s.__charEdit===i?null:i;renderV35Inspector(cspV35Root)}));body.querySelector('#v35-prompt-edit')?.addEventListener('input',e=>{s.promptState.finalPrompt=e.target.value;s.promptDirty=true;const d=cspV35Root.querySelector('#v35-dirty');if(d)d.textContent='● 프롬프트 수정됨'});body.querySelector('#v35-neg-edit')?.addEventListener('input',e=>{s.promptState.finalNegative=e.target.value;s.negativeDirty=true;const d=cspV35Root.querySelector('#v35-dirty');if(d)d.textContent='● 프롬프트 수정됨'});body.querySelector('#v35-char-prompt')?.addEventListener('input',e=>{if(Number.isInteger(s.__charEdit)&&s.promptState.charPrompts[s.__charEdit]){s.promptState.charPrompts[s.__charEdit].prompt=e.target.value;s.characterDirty=true}});body.querySelector('#v35-char-uc')?.addEventListener('input',e=>{if(Number.isInteger(s.__charEdit)&&s.promptState.charPrompts[s.__charEdit]){s.promptState.charPrompts[s.__charEdit].uc=e.target.value;s.characterDirty=true}});const sync=()=>{const g=s.generation,prevModel=g.model,m=body.querySelector('#v35-g-model');if(m)g.model=normalizeNaiModel(m.value);const w=body.querySelector('#v35-g-width');if(w)g.width=Number(w.value||832);const h=body.querySelector('#v35-g-height');if(h)g.height=Number(h.value||1216);const q=body.querySelector('#v35-g-quality');if(q)g.v5QualityPreset=normalizeNaiV5QualityPreset(q.value);const u=body.querySelector('#v35-g-uc');if(u){Object.assign(g,setNaiUcPresetForModel(g,prevModel,u.value));g.ucPreset=getNaiUcPresetForModel(g,g.model)}const tq=cspV35Root?.querySelector('#v35-q-quality');if(tq&&q)tq.value=g.v5QualityPreset;const tu=cspV35Root?.querySelector('#v35-q-uc');if(tu&&u&&prevModel===g.model)tu.value=String(g.ucPreset);const seed=body.querySelector('#v35-g-seed');if(seed)g.seed=seed.value.trim();const steps=body.querySelector('#v35-g-steps');if(steps)g.steps=Number(steps.value||28);const scale=body.querySelector('#v35-g-scale');if(scale)g.scale=Number(scale.value||5);const samp=body.querySelector('#v35-g-sampler');if(samp)g.sampler=samp.value;const noise=body.querySelector('#v35-g-noise');if(noise)g.noiseSchedule=noise.value;const res=body.querySelector('#v35-g-rescale');if(res)g.guidanceRescale=Number(res.value||0)};body.querySelectorAll('#v35-g-model,#v35-g-width,#v35-g-height,#v35-g-quality,#v35-g-uc,#v35-g-seed,#v35-g-steps,#v35-g-scale,#v35-g-sampler,#v35-g-noise,#v35-g-rescale').forEach(el=>el.addEventListener('change',()=>{const id=el.id;sync();if(id==='v35-g-model'){s.generation.ucPreset=getNaiUcPresetForModel(s.generation,s.generation.model);renderV35Studio()}}));body.querySelector('#v35-g-quality-toggle')?.addEventListener('click',()=>{s.generation.qualityToggle=!s.generation.qualityToggle;renderV35Inspector(cspV35Root)});body.querySelector('#v35-advanced')?.addEventListener('click',()=>{s.advanced=!s.advanced;patchV35Ui('studio',{advanced:s.advanced});renderV35Inspector(cspV35Root)});const summary=body.querySelector('#v35-generate-summary');
         summary?.addEventListener('click', event => {
@@ -11942,6 +11929,106 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
 
     function v35PromptRequest(){const s=cspV35Session,ps=s.promptState,chars=(ps.charPrompts||[]).map(c=>({...c,prompt:dedupePromptString(c.prompt||''),uc:dedupePromptString(c.uc||'')})),charPrompt=dedupePromptString(buildCommaPrompt(chars.map(c=>stripSubjectCountTags(c.prompt||'')))),charUc=dedupePromptString(buildCommaPrompt(chars.map(c=>c.uc||'')));let basePrompt=dedupePromptString(ps.basePrompt||''),baseNegative=dedupePromptString(ps.baseNegative||'');let finalPrompt=s.promptDirty?dedupePromptString(ps.finalPrompt||''):dedupePromptString(buildCommaPrompt([basePrompt,charPrompt]));let finalNegative=s.negativeDirty?dedupePromptString(ps.finalNegative||''):dedupePromptString(buildCommaPrompt([baseNegative,charUc]));if(s.promptDirty)basePrompt=removePromptTokens(finalPrompt,charPrompt)||finalPrompt;if(s.negativeDirty)baseNegative=removePromptTokens(finalNegative,charUc)||finalNegative;return{basePrompt,baseNegative,finalPrompt,finalNegative,charPrompts:chars}}
     function v35Decode(src){return new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>resolve(src);img.onerror=()=>reject(new Error('생성 이미지를 디코딩하지 못했어요.'));img.src=src;if(img.decode)img.decode().then(()=>resolve(src)).catch(()=>{})})}
+    async function runV35BatchGeneration() {
+        const s = cspV35Session;
+        if (!s?.markdown || !['idle', 'ready'].includes(s.status) || !isCurrentCspWorkTarget(s.workTarget)) return;
+        const { roomId, messageKey } = s.workTarget;
+        const record = normalizeSceneRecordHistory(getSceneRecords(roomId)[messageKey], messageKey);
+        const remaining = CSP_MAX_IMAGE_HISTORY - (record?.history?.length || 0);
+        const paragraphs = getParagraphs(s.markdown);
+        if (!remaining || !paragraphs.length) {
+            v35Toast(remaining ? '분석할 문단이 없어요.' : '이 답변은 이미 삽화가 세 장 있어요.', 'info');
+            return;
+        }
+        const limit = Math.min(remaining, paragraphs.length);
+        if (!confirm(`이 답변에서 다른 장면을 골라 최대 ${limit}장 생성할까요? NovelAI 생성 비용은 한 장씩 적용돼요.`)) return;
+
+        const controller = new AbortController();
+        const signal = controller.signal;
+        const assertTarget = () => {
+            throwIfCspAborted(signal);
+            assertCurrentCspWorkTarget(s.workTarget);
+            if (cspV35Session !== s) throw new Error('스튜디오가 닫혔어요.');
+        };
+        const renderCurrent = () => {
+            if (cspV35Session === s && cspV35Root?.dataset.view === 'studio' && roomId === getRoomId()) renderV35Studio();
+        };
+        s.batchController = controller;
+        s.status = 'analyzing';
+        s.statusMessage = '답변에서 삽화로 만들 장면을 고르는 중…';
+        s.error = '';
+        renderCurrent();
+        let completed = 0;
+        try {
+            const global = getGlobalSettings();
+            const room = getRoomSettings();
+            const settings = { ...s.generation, model: v35Model(), seed: '' };
+            const occupied = record ? await getInlineScenePlacements(record) : [];
+            const maxParagraphIndex = Math.max(0, getInsertableContentBlocks(s.markdown).length - 1);
+            const occupiedIndexes = new Set(occupied.map(index => Math.max(0, Math.min(Math.trunc(Number(index) || 0), maxParagraphIndex))));
+            const candidates = new Set(paragraphs.map(item => item.index).filter(index => !occupiedIndexes.has(index)));
+            const count = Math.min(limit, candidates.size);
+            if (!count) {
+                v35Toast('다른 삽화를 넣을 문단이 없어요.', 'info');
+                return;
+            }
+            const request = getGeminiGenerateContentRequestConfig(global);
+            const bundle = await buildCspVisualContextBundle(s.targetBubble, s.markdown, room);
+            assertTarget();
+            const instruction = `이번 호출은 한 답변의 삽화 여러 장을 계획한다. JSON 객체 {"scenes":[ScenePlan,...]}를 반환한다. scenes는 0개에서 ${count}개까지 쓴다. 각 항목은 아래 ScenePlan 필드를 갖춘다. 서로 다른 사건, 장소 또는 시각적 전환만 고른다. 한 장면을 여러 각도로 반복하거나 장수를 채우려고 새 사실을 만들지 않는다. insertAfterParagraph에는 다음 미사용 문단 번호 중 하나를 중복 없이 쓴다. ${[...candidates].join(', ')}.`;
+            const userPrompt = buildGeminiUserPrompt({ markdown: s.markdown, room, visualBundle: bundle, batchInstruction: instruction });
+            const result = await requestGeminiGenerateContent(request, {
+                systemInstruction: { parts: [{ text: getEffectiveGeminiSystemInstruction(global) + '\n\n' + instruction }] },
+                contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+                generationConfig: buildGeminiJsonGenerationConfig(request, { temperature: 0.2, topP: 0.8 })
+            }, { signal });
+            assertTarget();
+            const raw = extractJsonLoose(extractTextFromGeminiResponseData(result));
+            if (!Array.isArray(raw?.scenes)) throw new Error('여러 장면 분석 결과를 읽지 못했어요.');
+            const plans = [];
+            for (const item of raw.scenes) {
+                const index = item?.insertAfterParagraph;
+                if (!Number.isInteger(index) || !candidates.delete(index)) continue;
+                plans.push(normalizeGeminiScenePlan(item, room, s.markdown, index, null, bundle));
+                if (plans.length === count) break;
+            }
+            plans.sort((a, b) => a.insertAfterParagraph - b.insertAfterParagraph);
+            if (!plans.length) v35Toast('이 답변에서 새로 그릴 장면을 찾지 못했어요.', 'info');
+
+            for (const plan of plans) {
+                assertTarget();
+                const current = getSceneRecords(roomId)[messageKey];
+                if (isSceneHistoryFull(current)) break;
+                if (current && (await getInlineScenePlacements(current)).some(index => Number(index) === plan.insertAfterParagraph)) continue;
+                assertTarget();
+                s.status = 'generating';
+                s.statusMessage = `삽화 생성 중 · ${completed + 1} / ${plans.length}`;
+                renderCurrent();
+                const prompt = buildFinalPromptFromPlan(plan, room);
+                const imageUrl = await generateImageWithNai({ ...prompt, settings, signal });
+                assertTarget();
+                await insertFinalSceneImage({ ...prompt, markdown: s.markdown, workTarget: s.workTarget, imageUrl, plan, mode: 'nai', naiSettings: settings });
+                completed++;
+                const saved = getSceneRecords(roomId)[messageKey];
+                s.messageKey = messageKey;
+                s.currentHistoryIndex = saved ? clampHistoryIndex(saved) : null;
+                s.currentImageSrc = imageUrl;
+                s.plan = plan;
+                s.promptState = prompt;
+                s.promptDirty = s.negativeDirty = s.characterDirty = false;
+            }
+            if (completed && cspV35Session === s) v35Toast(`삽화 ${completed}장을 답변의 각 장면에 넣었어.`, 'success');
+        } catch (err) {
+            if (cspV35Session === s && !signal.aborted) s.error = `여러 장 생성 중단 · ${completed}장 저장됨 · ${err?.message || err}`;
+        } finally {
+            s.batchController = null;
+            s.status = s.currentImageSrc ? 'ready' : 'idle';
+            s.statusMessage = '';
+            renderCurrent();
+            if (completed && cspV35Session === s) refreshV35Quota();
+        }
+    }
+
     async function runV35Generation(reroll=false){
         if(cspComicSession) return cspComicRun(cspComicSession,()=>cspComicGenerate(cspComicSession,reroll),'NAI가 만화를 생성 중…');
         const s=cspV35Session;
@@ -13635,7 +13722,7 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
         const next=Math.floor(Math.random()*4294967296);
         return next===Number(previous)?(next+1)%4294967296:next;
     }
-    async function runCspQuickReroll({messageKey,index=null,button=null,box=null,img=null}={}) {
+    async function runCspQuickReroll({messageKey,index=null,button=null,box=null}={}) {
         const roomId=getRoomId(),taskKey=`${roomId}:${messageKey}`;
         if(cspQuickRerollTasks.has(taskKey))return null;
         const controller=new AbortController();
@@ -13671,7 +13758,7 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
             const current=getSceneRecords()[messageKey];
             if(!current)throw new Error('생성 중 원래 이미지 기록이 삭제됐어요.');
             const currentBox=box?.isConnected?box:document.querySelector(`.csp-generated-scene-image[data-message-key="${CSS.escape(messageKey)}"]`);
-            await commitGeneratedImageReroll({messageKey,record:current,imageUrl,plan,promptState:prompt,settings,box:currentBox,img:img?.isConnected?img:null,mode:'nai'});
+            await commitGeneratedImageReroll({messageKey,record:current,imageUrl,plan,promptState:prompt,settings,box:currentBox,mode:'nai'});
             if(cspComicSession?.roomId===roomId&&cspComicSession.messageKey===messageKey){cspComicSession.imageSrc=imageUrl;cspComicSession.comicQuotaCheckedAt=0;cspComicRefreshQuota(cspComicSession,{force:true});if(!cspComicSession.busy)cspComicRender(cspComicSession);}
             showToast('🔄 리롤 완료');
             return {imageUrl,seed:settings.seed,plan,settings};
@@ -13972,10 +14059,7 @@ ${folderSupported?`<div class="setting-row"><div class="setting-label"><b>자동
         if(record) {
             const box=document.querySelector(`.csp-generated-scene-image[data-message-key="${CSS.escape(s.messageKey)}"]`);
             await commitGeneratedImageReroll({messageKey:s.messageKey,record,imageUrl,plan:storedPlan,promptState:ps,settings,box,mode:'nai'});
-            if(s.markdown?.isConnected) {
-                removeSceneImage(s.markdown);
-                await reapplySavedScene(s.markdown,null,null,s.messageKey);
-            }
+            if(!box?.isConnected && s.markdown?.isConnected) await reapplySavedScene(s.markdown,null,null,s.messageKey);
         } else {
             if(!s.markdown?.isConnected) throw new Error('삽입할 메시지를 찾을 수 없어요. 캔버스에서 결과를 저장해줘.');
             await insertFinalSceneImage({markdown:s.markdown,imageUrl,plan:storedPlan,mode:'nai',...ps,naiSettings:settings});
@@ -14819,6 +14903,7 @@ ${st.text&&!s.busy?`<div class="v35m-reason ${st.tone}">${esc(st.text)}</div>`:'
         await putStoredImage(imageId, rendered.dataUrl);
         const item = {
             imageId, createdAt: Date.now(), outputKind: 'comic-mix',
+            paragraphIndex: getCurrentHistoryItem(record)?.paragraphIndex ?? record.plan?.insertAfterParagraph ?? record.paragraphIndex,
             mixerProjectId: s.mixer.project.id, mixerRenderId: imageId,
             promptArchiveId: getCurrentPromptArchiveId(record) || record.promptArchiveId || ''
         };
@@ -14828,12 +14913,8 @@ ${st.text&&!s.busy?`<div class="v35m-reason ${st.tone}">${esc(st.text)}</div>`:'
         s.mixer.project.renderedImageId = imageId; s.mixer.project.appliedAt = Date.now();
         await cspMixerSaveProject(s, { silent:true });
         const box = document.querySelector(`.csp-generated-scene-image[data-message-key="${CSS.escape(s.messageKey)}"]`);
-        if (box?.querySelector('img')) box.querySelector('img').src = rendered.dataUrl;
-        refreshImageHistoryControls(s.messageKey, box, record);
-        if (s.markdown?.isConnected) {
-            removeSceneImage(s.markdown);
-            await reapplySavedScene(s.markdown, null, null, s.messageKey);
-        }
+        if (box) await refreshInlineSceneImages(s.messageKey, box, record, rendered.dataUrl);
+        else if (s.markdown?.isConnected) await reapplySavedScene(s.markdown, null, null, s.messageKey);
         markSceneButtons(s.messageKey, true);
         s.imageSrc = rendered.dataUrl;
         return item;
