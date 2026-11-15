@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         🎨 Crack Scene Painter (크랙 장면 삽화)
 // @namespace    crack-scene-painter
-// @version      5.6.9
+// @version      5.7.0
 // @downloadURL  none
-// @description  크랙 AI 삽화 + 만화 콘티. 5.6.9: 스튜디오에 선택한 삽화 삭제 버튼 추가.
+// @description  크랙 AI 삽화 + 만화 콘티. 5.7.0: OpenAI 추론 강도를 Low, Medium, Max로 정리.
 // @match        https://crack.wrtn.ai/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -24,7 +24,7 @@
 (function () {
     'use strict';
 
-    const CSP_VERSION = '5.6.9';
+    const CSP_VERSION = '5.7.0';
     const CSP_PREFIX = 'csp_scene_painter';
     const GLOBAL_SETTINGS_KEY = `${CSP_PREFIX}_global_settings`;
     const SECRET_SETTINGS_KEY = `${CSP_PREFIX}_secret_settings_v1`;
@@ -244,12 +244,9 @@
     const OPENAI_DEFAULT_MODEL = 'gpt-6-luna';
     const OPENAI_DEFAULT_REASONING_EFFORT = 'low';
     const OPENAI_REASONING_LABELS = Object.freeze({
-        none: '끄기',
-        low: '낮음',
-        medium: '보통',
-        high: '높음',
-        xhigh: '매우 높음',
-        max: '최대'
+        low: 'Low',
+        medium: 'Medium',
+        max: 'Max'
     });
     const OPENAI_MODELS = Object.freeze({
         'gpt-6-luna': 'GPT-6 Luna',
@@ -263,22 +260,16 @@
         return Object.hasOwn(OPENAI_MODELS, id) ? id : OPENAI_DEFAULT_MODEL;
     }
 
-    function getOpenAiReasoningEfforts(model) {
-        const id = normalizeOpenAiModelId(model);
-        return Object.keys(OPENAI_REASONING_LABELS).filter(effort =>
-            effort !== 'none' || id === 'gpt-6-luna' || id === 'gpt-6.1-terra'
-        );
-    }
-
-    function normalizeOpenAiReasoningEffort(effort, model) {
+    function normalizeOpenAiReasoningEffort(effort) {
         const value = String(effort || '').trim().toLowerCase();
-        return getOpenAiReasoningEfforts(model).includes(value) ? value : OPENAI_DEFAULT_REASONING_EFFORT;
+        if (value === 'high' || value === 'xhigh') return 'medium';
+        return Object.hasOwn(OPENAI_REASONING_LABELS, value) ? value : OPENAI_DEFAULT_REASONING_EFFORT;
     }
 
-    function buildOpenAiReasoningOptionsHtml(model, effort) {
-        const selected = normalizeOpenAiReasoningEffort(effort, model);
-        return getOpenAiReasoningEfforts(model).map(value =>
-            `<option value="${value}" ${value === selected ? 'selected' : ''}>${OPENAI_REASONING_LABELS[value]} (${value})</option>`
+    function buildOpenAiReasoningOptionsHtml(effort) {
+        const selected = normalizeOpenAiReasoningEffort(effort);
+        return Object.entries(OPENAI_REASONING_LABELS).map(([value, label]) =>
+            `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`
         ).join('');
     }
 
@@ -1021,7 +1012,7 @@
             return {
                 provider,
                 model,
-                reasoningEffort: normalizeOpenAiReasoningEffort(global?.openaiReasoningEffort, model),
+                reasoningEffort: normalizeOpenAiReasoningEffort(global?.openaiReasoningEffort),
                 headers,
                 url: 'https://api.openai.com/v1/responses'
             };
@@ -2645,7 +2636,7 @@ director.lightingIntent:
             : normalizeSceneAnalyzerProvider(rawProvider);
         merged.deepseekModel = normalizeDeepSeekModelId(merged.deepseekModel);
         merged.openaiModel = normalizeOpenAiModelId(merged.openaiModel);
-        merged.openaiReasoningEffort = normalizeOpenAiReasoningEffort(merged.openaiReasoningEffort, merged.openaiModel);
+        merged.openaiReasoningEffort = normalizeOpenAiReasoningEffort(merged.openaiReasoningEffort);
         delete merged.vertexProjectId;
         delete merged.vertexLocation;
         delete merged.vertexAccessToken;
@@ -13365,7 +13356,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
             deepseekModel:normalizeDeepSeekModelId(h.querySelector('#s-deep-model')?.value||g.deepseekModel),
             openaiModel,
             openaiReasoningEffort: normalizeOpenAiReasoningEffort(
-                h.querySelector('#s-openai-effort')?.value || g.openaiReasoningEffort, openaiModel
+                h.querySelector('#s-openai-effort')?.value || g.openaiReasoningEffort
             ),
             // Firebase 칸은 Firebase를 골랐을 때만 그려지므로, 칸이 없으면 저장된 리전/SDK를 그대로 둔다.
             firebaseLocation:(h.querySelector('#s-floc')?h.querySelector('#s-floc').value.trim():g.firebaseLocation)||'global',firebaseSdkVersion:(h.querySelector('#s-fsdk')?h.querySelector('#s-fsdk').value.trim():g.firebaseSdkVersion)||'12.5.0',
@@ -13385,7 +13376,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
                 <select class="select" id="s-openai-model">${buildOpenAiModelOptionsHtml(g.openaiModel)}</select>
             </div>
             <div class="field"><label for="s-openai-effort">추론 강도</label>
-                <select class="select" id="s-openai-effort">${buildOpenAiReasoningOptionsHtml(g.openaiModel, g.openaiReasoningEffort)}</select>
+                <select class="select" id="s-openai-effort">${buildOpenAiReasoningOptionsHtml(g.openaiReasoningEffort)}</select>
             </div>
             <div class="field"><label for="s-openai-key">API 키</label>
                 <input class="input" id="s-openai-key" type="password" autocomplete="off" spellcheck="false" placeholder="${g.openaiApiKey?'저장됨 · 변경할 때만 입력':'OpenAI API Key'}">
@@ -13416,10 +13407,7 @@ ${selected && !ui.mode ? `<div class="pp-preview">${escapeHtml(selected.prompt |
                 saveGlobalSettings(v35ConnectionDraft(h));
                 v35Saved();
             };
-            openAiModel.addEventListener('change', () => {
-                openAiEffort.innerHTML = buildOpenAiReasoningOptionsHtml(openAiModel.value, openAiEffort.value);
-                saveOpenAiSelection();
-            });
+            openAiModel.addEventListener('change', saveOpenAiSelection);
             openAiEffort.addEventListener('change', saveOpenAiSelection);
         }
 
